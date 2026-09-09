@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.models import Appointment, AppointmentStatus, Business, Client, Service
-
+from app.services.booking import is_slot_conflict
 
 async def _seed(session):
     business = Business(
@@ -64,7 +64,7 @@ async def test_concurrent_overlapping_inserts(session_factory, session):
 
     assert len(oks) == 1
     assert len(errors) == 1
-    assert isinstance(errors[0], IntegrityError)
+    assert is_slot_conflict(errors[0])
 
 
 @pytest.mark.asyncio

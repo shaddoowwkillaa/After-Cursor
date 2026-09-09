@@ -15,8 +15,28 @@ from app.models import (
     Service,
 )
 
+import asyncpg
+from sqlalchemy.exc import IntegrityError, OperationalError
+
 SLOT_TAKEN_MESSAGE = "Это время только что заняли, выберите другое."
 
+def is_slot_conflict(exc: BaseException) -> bool:
+    """True, если база не дала создать запись, потому что слот занят.
+
+    PostgreSQL отклоняет проигравшую транзакцию двумя способами:
+    - нарушение exclusion constraint (IntegrityError);
+    - deadlock между двумя одновременными вставками (DeadlockDetectedError).
+
+    SQLAlchemy-asyncpg заворачивает deadlock в свой адаптер-класс,
+    и имя класса asyncpg остаётся только в тексте сообщения,
+    поэтому дополнительно проверяем текст.
+    """
+    if isinstance(exc, IntegrityError):
+        return True
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, asyncpg.exceptions.DeadlockDetectedError):
+        return True
+    return "DeadlockDetectedError" in str(exc)
 
 async def slot_taken(
     session: AsyncSession,

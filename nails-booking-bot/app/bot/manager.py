@@ -63,7 +63,7 @@ async def start_polling() -> None:
 
 async def stop_polling() -> None:
     global _polling_task, _notify_task, _dispatcher
-    if _dispatcher is not None:
+    if _dispatcher is not None and _polling_task is not None:
         await _dispatcher.stop_polling()
     if _polling_task is not None:
         try:
