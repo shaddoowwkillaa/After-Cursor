@@ -56,13 +56,35 @@ async def slot_taken(
     return await session.scalar(stmt) is not None
 
 
-def _add_client_reminders(
+def _add_reminders(
     session: AsyncSession,
     business: Business,
     appointment: Appointment,
     client: Client,
     now: datetime,
 ) -> None:
+    """Создаёт напоминания клиенту и мастеру по каждому офсету бизнеса."""
+    offsets = business.reminder_offsets_minutes or []
+    recipients = [
+        (RecipientType.client, client.telegram_id),
+        (RecipientType.master, business.owner_telegram_id),
+    ]
+    for offset in offsets:
+        send_at = appointment.starts_at - timedelta(minutes=int(offset))
+        if send_at <= now:
+            continue
+        for recipient_type, telegram_id in recipients:
+            session.add(
+                NotificationTask(
+                    business_id=business.id,
+                    appointment_id=appointment.id,
+                    recipient_type=recipient_type,
+                    telegram_id=telegram_id,
+                    type=NotificationType.reminder,
+                    send_at=send_at,
+                    status=NotificationStatus.pending,
+                )
+            )
     offsets = business.reminder_offsets_minutes or []
     for offset in offsets:
         send_at = appointment.starts_at - timedelta(minutes=int(offset))
@@ -124,7 +146,7 @@ async def create_appointment(
             status=NotificationStatus.pending,
         )
     )
-    _add_client_reminders(session, business, appointment, client, now)
+    _add_reminders(session, business, appointment, client, now)
     await session.commit()
     return appointment
 
@@ -181,7 +203,7 @@ async def reschedule_appointment(
     appointment.status = AppointmentStatus.confirmed
     await session.flush()
     await cancel_pending_reminders(session, appointment.id)
-    _add_client_reminders(session, business, appointment, client, now)
+    _add_reminders(session, business, appointment, client, now)
     for telegram_id, recipient in (
         (business.owner_telegram_id, RecipientType.master),
         (client.telegram_id, RecipientType.client),
