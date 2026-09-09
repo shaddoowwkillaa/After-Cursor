@@ -1,0 +1,181 @@
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import (
+    Appointment,
+    AppointmentStatus,
+    Business,
+    Client,
+    NotificationStatus,
+    NotificationTask,
+    NotificationType,
+    RecipientType,
+    Service,
+)
+
+SLOT_TAKEN_MESSAGE = "Это время только что заняли, выберите другое."
+
+
+async def slot_taken(
+    session: AsyncSession,
+    business_id: int,
+    starts_at: datetime,
+    ends_at: datetime,
+    exclude_id: int | None = None,
+) -> bool:
+    stmt = select(Appointment.id).where(
+        Appointment.business_id == business_id,
+        Appointment.status == AppointmentStatus.confirmed,
+        Appointment.starts_at < ends_at,
+        Appointment.ends_at > starts_at,
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(Appointment.id != exclude_id)
+    return await session.scalar(stmt) is not None
+
+
+def _add_client_reminders(
+    session: AsyncSession,
+    business: Business,
+    appointment: Appointment,
+    client: Client,
+    now: datetime,
+) -> None:
+    offsets = business.reminder_offsets_minutes or []
+    for offset in offsets:
+        send_at = appointment.starts_at - timedelta(minutes=int(offset))
+        if send_at <= now:
+            continue
+        session.add(
+            NotificationTask(
+                business_id=business.id,
+                appointment_id=appointment.id,
+                recipient_type=RecipientType.client,
+                telegram_id=client.telegram_id,
+                type=NotificationType.reminder,
+                send_at=send_at,
+                status=NotificationStatus.pending,
+            )
+        )
+
+
+async def cancel_pending_reminders(session: AsyncSession, appointment_id: int) -> None:
+    await session.execute(
+        update(NotificationTask)
+        .where(
+            NotificationTask.appointment_id == appointment_id,
+            NotificationTask.status == NotificationStatus.pending,
+            NotificationTask.type == NotificationType.reminder,
+        )
+        .values(status=NotificationStatus.canceled)
+    )
+
+
+async def create_appointment(
+    session: AsyncSession,
+    business: Business,
+    client: Client,
+    service: Service,
+    starts_at: datetime,
+) -> Appointment:
+    now = datetime.now(timezone.utc)
+    ends_at = starts_at + timedelta(minutes=service.duration_minutes)
+    appointment = Appointment(
+        business_id=business.id,
+        client_id=client.id,
+        service_id=service.id,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        status=AppointmentStatus.confirmed,
+    )
+    session.add(appointment)
+    await session.flush()
+
+    session.add(
+        NotificationTask(
+            business_id=business.id,
+            appointment_id=appointment.id,
+            recipient_type=RecipientType.master,
+            telegram_id=business.owner_telegram_id,
+            type=NotificationType.new_booking,
+            send_at=now,
+            status=NotificationStatus.pending,
+        )
+    )
+    _add_client_reminders(session, business, appointment, client, now)
+    await session.commit()
+    return appointment
+
+
+async def cancel_appointment(
+    session: AsyncSession,
+    business: Business,
+    appointment: Appointment,
+    notify_telegram_id: int,
+) -> None:
+    now = datetime.now(timezone.utc)
+    appointment.status = AppointmentStatus.canceled
+    await cancel_pending_reminders(session, appointment.id)
+    session.add(
+        NotificationTask(
+            business_id=business.id,
+            appointment_id=appointment.id,
+            recipient_type=RecipientType.master
+            if notify_telegram_id == business.owner_telegram_id
+            else RecipientType.client,
+            telegram_id=notify_telegram_id,
+            type=NotificationType.canceled,
+            send_at=now,
+            status=NotificationStatus.pending,
+        )
+    )
+    await session.commit()
+
+
+async def complete_appointment(session: AsyncSession, appointment: Appointment) -> None:
+    appointment.status = AppointmentStatus.completed
+    await session.execute(
+        update(NotificationTask)
+        .where(
+            NotificationTask.appointment_id == appointment.id,
+            NotificationTask.status == NotificationStatus.pending,
+        )
+        .values(status=NotificationStatus.canceled)
+    )
+    await session.commit()
+
+
+async def reschedule_appointment(
+    session: AsyncSession,
+    business: Business,
+    appointment: Appointment,
+    client: Client,
+    service: Service,
+    new_starts_at: datetime,
+) -> Appointment:
+    now = datetime.now(timezone.utc)
+    appointment.starts_at = new_starts_at
+    appointment.ends_at = new_starts_at + timedelta(minutes=service.duration_minutes)
+    appointment.status = AppointmentStatus.confirmed
+    await session.flush()
+    await cancel_pending_reminders(session, appointment.id)
+    _add_client_reminders(session, business, appointment, client, now)
+    for telegram_id, recipient in (
+        (business.owner_telegram_id, RecipientType.master),
+        (client.telegram_id, RecipientType.client),
+    ):
+        session.add(
+            NotificationTask(
+                business_id=business.id,
+                appointment_id=appointment.id,
+                recipient_type=recipient,
+                telegram_id=telegram_id,
+                type=NotificationType.rescheduled,
+                send_at=now,
+                status=NotificationStatus.pending,
+            )
+        )
+    await session.commit()
+    return appointment

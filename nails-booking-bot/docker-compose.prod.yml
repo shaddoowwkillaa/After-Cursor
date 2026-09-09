@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:16
+    container_name: nails_db_prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nails
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nails_dev_password}
+      POSTGRES_DB: nails_booking
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nails -d nails_booking"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    container_name: nails_app
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata_prod:
