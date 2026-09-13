@@ -23,6 +23,7 @@ from app.bot.keyboards import (
     SlotCB,
     SvcActCB,
     appointment_actions_kb,
+    dates_kb,
     master_days_kb,
     master_main_kb,
 )
@@ -613,31 +614,30 @@ async def windows_home(message: Message, session: AsyncSession, business: Busine
 
 
 @router.callback_query(F.data == "winadd")
-async def win_add_start(callback: CallbackQuery, state: FSMContext):
+async def win_add_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    tz = _tz(business)
+    today = datetime.now(tz).date()
+    dates = [today + timedelta(days=i) for i in range(business.max_booking_days)]
     await state.set_state(MasterFSM.win_date)
-    await callback.message.answer(
-        "Дата дня окошек (ДД.ММ.ГГГГ). Если день уже есть, времена добавятся к нему."
-    )
+    await callback.message.answer("Выбери день для окошек:", reply_markup=dates_kb(dates))
     await callback.answer()
 
 
-@router.message(MasterFSM.win_date, F.text)
-async def win_date_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
-    day = parse_ru_date(message.text or "")
-    if day is None:
-        await message.answer("Не понял дату. Пример: 10.10.2026")
-        return
-    tz = _tz(business)
-    today = datetime.now(tz).date()
-    last = today + timedelta(days=business.max_booking_days - 1)
-    if day < today or day > last:
-        await message.answer(
-            f"Окошки можно выкладывать с {today.strftime('%d.%m')} по {last.strftime('%d.%m')}."
-        )
-        return
-    await state.update_data(win_date=day.isoformat())
+@router.callback_query(MasterFSM.win_date, DateCB.filter())
+async def win_date_save(
+    callback: CallbackQuery,
+    callback_data: DateCB,
+    state: FSMContext,
+):
+    await state.update_data(win_date=callback_data.d)
     await state.set_state(MasterFSM.win_times)
-    await message.answer("Времена через пробел или запятую, например: 10:30 14:00 17:30")
+    await callback.message.answer("Времена через пробел или запятую, например: 10:30 14:00 17:30")
+    await callback.answer()
 
 
 @router.message(MasterFSM.win_times, F.text)
@@ -677,18 +677,43 @@ async def win_times_save(message: Message, session: AsyncSession, business: Busi
 
 
 @router.callback_query(F.data == "windel")
-async def win_del_start(callback: CallbackQuery, state: FSMContext):
+async def win_del_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    today = datetime.now(_tz(business)).date()
+    dates = (
+        await session.scalars(
+            select(DayWindow.date)
+            .where(
+                DayWindow.business_id == business.id,
+                DayWindow.date >= today,
+            )
+            .order_by(DayWindow.date)
+            .distinct()
+        )
+    ).all()
+    if not dates:
+        await callback.answer("Окошек пока нет", show_alert=True)
+        return
     await state.set_state(MasterFSM.win_del_date)
-    await callback.message.answer("Дата, с которой убрать окошки (ДД.ММ.ГГГГ):")
+    await callback.message.answer(
+        "С какого дня убрать окошки?", reply_markup=dates_kb(list(dates))
+    )
     await callback.answer()
 
 
-@router.message(MasterFSM.win_del_date, F.text)
-async def win_del_date_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
-    day = parse_ru_date(message.text or "")
-    if day is None:
-        await message.answer("Не понял дату. Пример: 10.10.2026")
-        return
+@router.callback_query(MasterFSM.win_del_date, DateCB.filter())
+async def win_del_date_save(
+    callback: CallbackQuery,
+    callback_data: DateCB,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     windows = (
         await session.scalars(
             select(DayWindow)
@@ -698,7 +723,7 @@ async def win_del_date_save(message: Message, session: AsyncSession, business: B
     ).all()
     if not windows:
         await state.clear()
-        await message.answer("На эту дату окошек нет.")
+        await callback.answer("На эту дату окошек нет", show_alert=True)
         return
     tz = _tz(business)
     rows = [
@@ -711,13 +736,19 @@ async def win_del_date_save(message: Message, session: AsyncSession, business: B
         for w in windows
     ]
     rows.append(
-        [InlineKeyboardButton(text="🗑 Очистить день целиком", callback_data=WindowCB(id=0, d=day.isoformat()).pack())]
+        [
+            InlineKeyboardButton(
+                text="🗑 Очистить день целиком",
+                callback_data=WindowCB(id=0, d=day.isoformat()).pack(),
+            )
+        ]
     )
     await state.clear()
-    await message.answer(
+    await callback.message.answer(
         f"Окошки на {day.strftime('%d.%m.%Y')}. Нажми, чтобы убрать:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
+    await callback.answer()
 
 
 @router.callback_query(WindowCB.filter())
