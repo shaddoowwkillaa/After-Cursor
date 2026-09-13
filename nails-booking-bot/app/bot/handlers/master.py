@@ -111,21 +111,32 @@ async def appts_tomorrow(callback: CallbackQuery, session: AsyncSession, busines
 
 
 @router.callback_query(F.data == "md:pick")
-async def appts_pick(callback: CallbackQuery, state: FSMContext):
+async def appts_pick(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    tz = _tz(business)
+    today = datetime.now(tz).date()
+    dates = [today + timedelta(days=i) for i in range(business.max_booking_days)]
     await state.set_state(MasterFSM.pick_day)
-    await callback.message.answer("Введите дату в формате ДД.ММ.ГГГГ")
+    await callback.message.answer("Записи за какой день смотреть?", reply_markup=dates_kb(dates))
     await callback.answer()
 
 
-@router.message(MasterFSM.pick_day, F.text)
-async def appts_picked(message: Message, session: AsyncSession, business: Business, state: FSMContext):
-    day = parse_ru_date(message.text or "")
-    if day is None:
-        await message.answer("Не понял дату. Пример: 10.09.2026")
-        return
+@router.callback_query(MasterFSM.pick_day, DateCB.filter())
+async def appts_picked(
+    callback: CallbackQuery,
+    callback_data: DateCB,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     await state.clear()
-    await _send_day_appts(message, session, business, day)
-
+    day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
+    await _send_day_appts(callback.message, session, business, day)
+    await callback.answer()
 
 async def _send_day_appts(message, session, business: Business, day):
     tz = _tz(business)
@@ -143,23 +154,46 @@ async def _send_day_appts(message, session, business: Business, day):
             .order_by(Appointment.starts_at)
         )
     ).all()
-    if not appts:
-        await message.answer(f"На {day.strftime('%d.%m.%Y')} записей нет.")
+    windows = (
+        await session.scalars(
+            select(DayWindow)
+            .where(
+                DayWindow.business_id == business.id,
+                DayWindow.date == day,
+            )
+            .order_by(DayWindow.starts_at)
+        )
+    ).all()
+    booked = {a.starts_at for a in appts}
+
+    if not appts and not windows:
+        await message.answer(f"На {day.strftime('%d.%m.%Y')} записей и окошек нет.")
         return
-    await message.answer(f"Записи на {day.strftime('%d.%m.%Y')}:")
-    for appt in appts:
-        client_name = appt.client.full_name or str(appt.client.telegram_id)
-        phone = appt.client.phone or "—"
-        text = (
-            appointment_card(appt, business, appt.service)
-            + f"\nКлиент: {client_name}\nТелефон: {phone}"
-        )
-        kb = (
-            appointment_actions_kb(appt.id, for_master=True)
-            if appt.status == AppointmentStatus.confirmed
-            else None
-        )
-        await message.answer(text, reply_markup=kb)
+
+    if appts:
+        await message.answer(f"Записи на {day.strftime('%d.%m.%Y')}:")
+        for appt in appts:
+            client_name = appt.client.full_name or str(appt.client.telegram_id)
+            phone = appt.client.phone or "—"
+            text = (
+                appointment_card(appt, business, appt.service)
+                + f"\nКлиент: {client_name}\nТелефон: {phone}"
+            )
+            kb = (
+                appointment_actions_kb(appt.id, for_master=True)
+                if appt.status == AppointmentStatus.confirmed
+                else None
+            )
+            await message.answer(text, reply_markup=kb)
+    else:
+        await message.answer(f"На {day.strftime('%d.%m.%Y')} записей нет.")
+
+    if windows:
+        parts = []
+        for w in windows:
+            label = w.starts_at.astimezone(tz).strftime("%H:%M")
+            parts.append(f"{label} 🔒" if w.starts_at in booked else label)
+        await message.answer("Окошки дня: " + " · ".join(parts))
 
 
 @router.callback_query(ApptActCB.filter(F.act == "c"))
