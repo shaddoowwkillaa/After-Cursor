@@ -42,7 +42,7 @@ async def _text_for_task(session, task: NotificationTask) -> str:
     if appt is None or business is None:
         return "Уведомление о записи."
 
-    card = appointment_card(appt, business, appt.service)
+    card = task.card_text or appointment_card(appt, business, appt.service)
     if task.type == NotificationType.new_booking:
         return "Новая запись.\n" + card
     if task.type == NotificationType.canceled:

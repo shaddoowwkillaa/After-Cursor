@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -14,11 +16,10 @@ from app.models import (
     RecipientType,
     Service,
 )
-
-import asyncpg
-from sqlalchemy.exc import IntegrityError, OperationalError
+from app.services.formatting import appointment_card
 
 SLOT_TAKEN_MESSAGE = "Это время только что заняли, выберите другое."
+
 
 def is_slot_conflict(exc: BaseException) -> bool:
     """True, если база не дала создать запись, потому что слот занят.
@@ -37,6 +38,7 @@ def is_slot_conflict(exc: BaseException) -> bool:
     if isinstance(orig, asyncpg.exceptions.DeadlockDetectedError):
         return True
     return "DeadlockDetectedError" in str(exc)
+
 
 async def slot_taken(
     session: AsyncSession,
@@ -85,22 +87,6 @@ def _add_reminders(
                     status=NotificationStatus.pending,
                 )
             )
-    offsets = business.reminder_offsets_minutes or []
-    for offset in offsets:
-        send_at = appointment.starts_at - timedelta(minutes=int(offset))
-        if send_at <= now:
-            continue
-        session.add(
-            NotificationTask(
-                business_id=business.id,
-                appointment_id=appointment.id,
-                recipient_type=RecipientType.client,
-                telegram_id=client.telegram_id,
-                type=NotificationType.reminder,
-                send_at=send_at,
-                status=NotificationStatus.pending,
-            )
-        )
 
 
 async def cancel_pending_reminders(session: AsyncSession, appointment_id: int) -> None:
@@ -144,6 +130,7 @@ async def create_appointment(
             type=NotificationType.new_booking,
             send_at=now,
             status=NotificationStatus.pending,
+            card_text=appointment_card(appointment, business, service),
         )
     )
     _add_reminders(session, business, appointment, client, now)
@@ -171,6 +158,7 @@ async def cancel_appointment(
             type=NotificationType.canceled,
             send_at=now,
             status=NotificationStatus.pending,
+            card_text=appointment_card(appointment, business, appointment.service),
         )
     )
     await session.commit()
@@ -217,6 +205,7 @@ async def reschedule_appointment(
                 type=NotificationType.rescheduled,
                 send_at=now,
                 status=NotificationStatus.pending,
+                card_text=appointment_card(appointment, business, service),
             )
         )
     await session.commit()
