@@ -47,7 +47,7 @@ async def ask_slots(
         if w["is_free"]:
             builder.button(text=label, callback_data=SlotCB(ts=int(w["starts_at"].timestamp())).pack())
         else:
-            builder.button(text=f"{label} 🔒")
+            builder.button(text=f"{label} 🔒", callback_data="slot:locked")
     builder.adjust(4)
     await message.answer(
         f"Свободное время на {local_date.strftime('%d.%m.%Y')}:",

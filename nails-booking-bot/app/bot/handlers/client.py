@@ -164,6 +164,9 @@ async def book_back_to_dates(
     await ask_dates(callback.message, session, business, state)
     await callback.answer()
 
+@router.callback_query(F.data == "slot:locked")
+async def slot_locked_client(callback: CallbackQuery):
+    await callback.answer("Это время уже занято.", show_alert=True)
 
 @router.callback_query(BookFSM.choosing_slot, SlotCB.filter())
 async def book_slot(callback: CallbackQuery, callback_data: SlotCB, state: FSMContext):

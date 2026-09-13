@@ -813,3 +813,7 @@ async def win_delete(
         await callback.message.answer("Окошко убрано.")
     await callback.message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
     await callback.answer()
+    
+@router.callback_query(F.data == "slot:locked")
+async def slot_locked_master(callback: CallbackQuery):
+    await callback.answer("Это время уже занято.", show_alert=True)
