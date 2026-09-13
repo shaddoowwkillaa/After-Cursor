@@ -47,6 +47,7 @@ class NotificationType(StrEnum):
     new_booking = "new_booking"
     canceled = "canceled"
     rescheduled = "rescheduled"
+    day_digest = "day_digest"
 
 
 class Business(Base):
