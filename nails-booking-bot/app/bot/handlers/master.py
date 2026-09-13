@@ -67,6 +67,8 @@ class MasterFSM(StatesGroup):
     win_date = State()
     win_times = State()
     win_del_date = State()
+    set_name = State()
+    set_rem = State()
 
 
 def _tz(business: Business) -> ZoneInfo:
@@ -813,7 +815,124 @@ async def win_delete(
         await callback.message.answer("Окошко убрано.")
     await callback.message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
     await callback.answer()
-    
+
 @router.callback_query(F.data == "slot:locked")
 async def slot_locked_master(callback: CallbackQuery):
     await callback.answer("Это время уже занято.", show_alert=True)
+
+# --- настройки ---
+
+
+def _offsets_human(offsets: list[int]) -> str:
+    if not offsets:
+        return "выключены"
+    parts = []
+    for m in offsets:
+        if m % 1440 == 0:
+            parts.append(f"за {m // 1440} дн")
+        elif m % 60 == 0:
+            parts.append(f"за {m // 60} ч")
+        else:
+            parts.append(f"за {m} мин")
+    return ", ".join(parts)
+
+
+def _reminders_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="За сутки и за 2 часа", callback_data="set:rem:1440,120")],
+            [InlineKeyboardButton(text="За сутки, 2 часа и 30 минут", callback_data="set:rem:1440,120,30")],
+            [InlineKeyboardButton(text="Только за 2 часа", callback_data="set:rem:120")],
+            [InlineKeyboardButton(text="Выключить напоминания", callback_data="set:rem:")],
+            [InlineKeyboardButton(text="Свои значения", callback_data="set:rem:custom")],
+        ]
+    )
+
+
+@router.message(F.text == "⚙️ Настройки")
+async def settings_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    await state.clear()
+    offsets = business.reminder_offsets_minutes or []
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Название кабинета", callback_data="set:name")],
+            [InlineKeyboardButton(text="🔔 Напоминания", callback_data="set:rem")],
+        ]
+    )
+    await message.answer(
+        f"Настройки кабинета:\nИмя: {business.name}\nНапоминания: {_offsets_human(list(offsets))}",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "set:name")
+async def set_name_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MasterFSM.set_name)
+    await callback.message.answer("Новое название кабинета (до 100 символов):")
+    await callback.answer()
+
+
+@router.message(MasterFSM.set_name, F.text)
+async def set_name_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.answer("Слишком коротко. Введите ещё раз.")
+        return
+    business.name = name[:100]
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"Готово. Теперь кабинет называется «{business.name}».",
+        reply_markup=master_main_kb(),
+    )
+
+
+@router.callback_query(F.data == "set:rem")
+async def set_rem_start(callback: CallbackQuery):
+    await callback.message.answer("Когда напоминать о визите?", reply_markup=_reminders_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set:rem:"))
+async def set_rem_save(callback: CallbackQuery, session: AsyncSession, business: Business, state: FSMContext):
+    payload = callback.data[len("set:rem:"):]
+    if payload == "custom":
+        await state.set_state(MasterFSM.set_rem)
+        await callback.message.answer("Минуты до визита через запятую, например: 1440,120,30")
+        await callback.answer()
+        return
+    offsets = [int(x) for x in payload.split(",") if x]
+    business.reminder_offsets_minutes = offsets
+    await session.commit()
+    await state.clear()
+    await callback.message.answer(
+        f"Напоминания обновлены: {_offsets_human(offsets)}. Новые записи получат этот набор.",
+        reply_markup=master_main_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(MasterFSM.set_rem, F.text)
+async def set_rem_custom_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    parts = (message.text or "").replace(" ", "").split(",")
+    offsets: list[int] = []
+    for p in parts:
+        if not p.isdigit():
+            await message.answer("Формат: минуты через запятую, например 1440,120,30")
+            return
+        v = int(p)
+        if v <= 0 or v > 43200:
+            await message.answer("Каждое значение — от 1 до 43200 минут.")
+            return
+        offsets.append(v)
+    if not offsets:
+        await message.answer("Нужно хотя бы одно значение или кнопка «Выключить».")
+        return
+    offsets = sorted(set(offsets), reverse=True)
+    business.reminder_offsets_minutes = offsets
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"Напоминания обновлены: {_offsets_human(offsets)}. Новые записи получат этот набор.",
+        reply_markup=master_main_kb(),
+    )
