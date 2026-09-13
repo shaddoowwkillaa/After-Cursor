@@ -1,16 +1,13 @@
 from datetime import date, datetime, time
 
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.keyboards import dates_kb, slots_kb
-from app.models import Business, Service
-from app.services.slots import get_bookable_dates, get_free_slots
-
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
 from app.bot.keyboards import SlotCB, dates_kb
+from app.models import Business, Service
 from app.services.slots import get_bookable_dates, get_day_windows
+
 
 
 async def ask_dates(message, session: AsyncSession, business: Business, state: FSMContext) -> bool:

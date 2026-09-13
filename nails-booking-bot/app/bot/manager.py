@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 from sqlalchemy import select
 
 from app.bot.handlers import client as client_handlers
@@ -50,6 +51,12 @@ async def start_polling() -> None:
             log.error("не удалось запустить бота бизнеса %s: %s", business.id, exc)
             await bot.session.close()
             continue
+        try:
+            await bot.set_my_commands(
+                [BotCommand(command="start", description="Открыть главное меню")]
+            )
+        except Exception:
+            log.exception("не удалось установить меню команд для бизнеса %s", business.id)
         log.info("бот @%s для бизнеса %s", me.username, business.id)
         bots_by_business_id[business.id] = bot
         bots.append(bot)
