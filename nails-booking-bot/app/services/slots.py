@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from app.models import Appointment, AppointmentStatus, Business, DayWindow, Service
 
 
-def _exists_local(local_date: date, local_time, tz: ZoneInfo) -> datetime | None:
+def _exists_local(local_date: date, local_time: time, tz: ZoneInfo) -> datetime | None:
     """Собирает aware-datetime; пропускает несуществующий момент (разрыв DST)."""
     naive = datetime.combine(local_date, local_time)
     aware = naive.replace(tzinfo=tz)
@@ -30,15 +30,14 @@ async def get_day_windows(
         "window": DayWindow,
         "starts_at": datetime (UTC),
         "is_free": bool,
+        "reason": None | "past" | "busy",
     }
     """
     tz = ZoneInfo(business.timezone)
 
-    day_start_utc = datetime.combine(local_date, datetime.min.time(), tzinfo=tz).astimezone(
-        timezone.utc
-    )
+    day_start_utc = datetime.combine(local_date, time.min, tzinfo=tz).astimezone(timezone.utc)
     day_end_utc = datetime.combine(
-        local_date + timedelta(days=1), datetime.min.time(), tzinfo=tz
+        local_date + timedelta(days=1), time.min, tzinfo=tz
     ).astimezone(timezone.utc)
 
     windows = (
@@ -73,15 +72,16 @@ async def get_day_windows(
         slot_start = w.starts_at
         slot_end = slot_start + timedelta(minutes=duration_minutes)
 
-        # Проверяем min_notice
         if slot_start < now_utc + timedelta(minutes=min_notice):
             is_free = False
+            reason = "past"
         else:
-            # Проверяем пересечение с записями
             is_free = True
+            reason = None
             for a in appts:
                 if a.starts_at < slot_end and a.ends_at > slot_start:
                     is_free = False
+                    reason = "busy"
                     break
 
         result.append(
@@ -89,6 +89,7 @@ async def get_day_windows(
                 "window": w,
                 "starts_at": slot_start,
                 "is_free": is_free,
+                "reason": reason,
             }
         )
 
@@ -102,7 +103,7 @@ async def get_free_slots(
     local_date: date,
     now_utc: datetime | None = None,
 ) -> list[datetime]:
-    """Свободные окошки для записи (старый API, для совместимости)."""
+    """Свободные окошки для записи (совместимый API)."""
     windows = await get_day_windows(session, business, local_date, service)
     return [w["starts_at"] for w in windows if w["is_free"]]
 
@@ -112,9 +113,8 @@ async def get_bookable_dates(
     business: Business,
     today: date,
 ) -> list[date]:
-    """Даты, где есть хотя бы одно свободное окошко."""
+    """Даты горизонта, где есть хотя бы одно свободное окошко."""
     last = today + timedelta(days=business.max_booking_days - 1)
-
     windows = (
         await session.scalars(
             select(DayWindow).where(
@@ -124,17 +124,11 @@ async def get_bookable_dates(
             )
         )
     ).all()
-
-    # Группируем по дате
-    dates_with_windows = set(w.date for w in windows)
-
-    # Проверяем, есть ли свободные окошки на каждую дату
-    bookable = []
-    for d in sorted(dates_with_windows):
-        free = await get_free_slots(session, business, Service(id=0, duration_minutes=1, price_minor=0, name="", business_id=business.id, is_active=True), d)
-        if free:
+    bookable: list[date] = []
+    for d in sorted({w.date for w in windows}):
+        items = await get_day_windows(session, business, d, None)
+        if any(item["is_free"] for item in items):
             bookable.append(d)
-
     return bookable
 
 
@@ -142,9 +136,9 @@ async def add_day_window(
     session: AsyncSession,
     business: Business,
     local_date: date,
-    local_time,
+    local_time: time,
 ) -> DayWindow | None:
-    """Добавить окошко. Возвращает созданное окошко или None, если не существует момент."""
+    """Добавить окошко. None, если момента не существует (разрыв DST)."""
     tz = ZoneInfo(business.timezone)
     starts_at = _exists_local(local_date, local_time, tz)
     if starts_at is None:
@@ -161,7 +155,7 @@ async def add_day_window(
 
 
 async def remove_day_window(session: AsyncSession, window_id: int, business_id: int) -> bool:
-    """Удалить окошко. Возвращает True, если удалили."""
+    """Удалить окошко. True, если удалили."""
     window = await session.scalar(
         select(DayWindow).where(
             DayWindow.id == window_id,

@@ -7,7 +7,6 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from aiogram.filters import CallbackData, CommandStart
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import OperationalError
