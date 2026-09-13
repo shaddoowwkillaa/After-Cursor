@@ -815,3 +815,182 @@ async def win_delete(
         await callback.message.answer("Окошко убрано.")
     await callback.message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
     await callback.answer()
+
+@router.message(F.text == "Окошки")
+async def windows_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    await state.clear()
+    await message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+
+
+@router.callback_query(F.data == "winadd")
+async def win_add_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    tz = _tz(business)
+    today = datetime.now(tz).date()
+    dates = [today + timedelta(days=i) for i in range(business.max_booking_days)]
+    await state.set_state(MasterFSM.win_date)
+    await callback.message.answer("Выбери день для окошек:", reply_markup=dates_kb(dates))
+    await callback.answer()
+
+
+@router.callback_query(MasterFSM.win_date, DateCB.filter())
+async def win_date_save(
+    callback: CallbackQuery,
+    callback_data: DateCB,
+    state: FSMContext,
+):
+    await state.update_data(win_date=callback_data.d)
+    await state.set_state(MasterFSM.win_times)
+    await callback.message.answer("Времена через пробел или запятую, например: 10:30 14:00 17:30")
+    await callback.answer()
+
+
+@router.message(MasterFSM.win_times, F.text)
+async def win_times_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    times = _parse_times(message.text or "")
+    if times is None:
+        await message.answer("Формат: 10:30 14:00 17:30")
+        return
+    data = await state.get_data()
+    day = datetime.strptime(data["win_date"], "%Y-%m-%d").date()
+    tz = _tz(business)
+    added = skipped_dup = skipped_dst = 0
+    for t in times:
+        aware_utc = _local_to_utc(day, t, tz)
+        if aware_utc is None:
+            skipped_dst += 1
+            continue
+        exists = await session.scalar(
+            select(DayWindow.id).where(
+                DayWindow.business_id == business.id,
+                DayWindow.starts_at == aware_utc,
+            )
+        )
+        if exists:
+            skipped_dup += 1
+            continue
+        session.add(DayWindow(business_id=business.id, date=day, starts_at=aware_utc))
+        added += 1
+    await session.commit()
+    await state.clear()
+    msg = f"Добавлено окошек: {added}."
+    if skipped_dup:
+        msg += f" Уже были: {skipped_dup}."
+    if skipped_dst:
+        msg += f" Пропущено несуществующее время: {skipped_dst}."
+    await message.answer(msg + "\n\n" + await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+
+
+@router.callback_query(F.data == "windel")
+async def win_del_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    today = datetime.now(_tz(business)).date()
+    dates = (
+        await session.scalars(
+            select(DayWindow.date)
+            .where(
+                DayWindow.business_id == business.id,
+                DayWindow.date >= today,
+            )
+            .order_by(DayWindow.date)
+            .distinct()
+        )
+    ).all()
+    if not dates:
+        await callback.answer("Окошек пока нет", show_alert=True)
+        return
+    await state.set_state(MasterFSM.win_del_date)
+    await callback.message.answer("С какого дня убрать окошки?", reply_markup=dates_kb(list(dates)))
+    await callback.answer()
+
+
+@router.callback_query(MasterFSM.win_del_date, DateCB.filter())
+async def win_del_date_save(
+    callback: CallbackQuery,
+    callback_data: DateCB,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
+    windows = (
+        await session.scalars(
+            select(DayWindow)
+            .where(DayWindow.business_id == business.id, DayWindow.date == day)
+            .order_by(DayWindow.starts_at)
+        )
+    ).all()
+    if not windows:
+        await state.clear()
+        await callback.answer("На эту дату окошек нет", show_alert=True)
+        return
+    tz = _tz(business)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"✖ {w.starts_at.astimezone(tz).strftime('%H:%M')}",
+                callback_data=WindowCB(id=w.id, d=day.isoformat()).pack(),
+            )
+        ]
+        for w in windows
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🗑 Очистить день целиком",
+                callback_data=WindowCB(id=0, d=day.isoformat()).pack(),
+            )
+        ]
+    )
+    await state.clear()
+    await callback.message.answer(
+        f"Окошки на {day.strftime('%d.%m.%Y')}. Нажми, чтобы убрать:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(WindowCB.filter())
+async def win_delete(
+    callback: CallbackQuery,
+    callback_data: WindowCB,
+    session: AsyncSession,
+    business: Business,
+):
+    day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
+    if callback_data.id == 0:
+        rows = (
+            await session.scalars(
+                select(DayWindow).where(
+                    DayWindow.business_id == business.id,
+                    DayWindow.date == day,
+                )
+            )
+        ).all()
+        for w in rows:
+            await session.delete(w)
+        await session.commit()
+        await callback.message.answer(f"День {day.strftime('%d.%m')} очищен.")
+    else:
+        w = await session.scalar(
+            select(DayWindow).where(
+                DayWindow.id == callback_data.id,
+                DayWindow.business_id == business.id,
+            )
+        )
+        if w is None:
+            await callback.answer("Уже убрано", show_alert=True)
+            return
+        await session.delete(w)
+        await session.commit()
+        await callback.message.answer("Окошко убрано.")
+    await callback.message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+    await callback.answer()
