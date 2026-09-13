@@ -29,7 +29,7 @@ def master_main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Записи"), KeyboardButton(text="Клиенты")],
-            [KeyboardButton(text="Услуги"), KeyboardButton(text="Расписание")],
+            [KeyboardButton(text="Услуги"), KeyboardButton(text="Окошки")],
         ],
         resize_keyboard=True,
     )

@@ -1,8 +1,9 @@
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
+from aiogram.filters import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -14,30 +15,24 @@ from app.services.booking import is_slot_conflict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
-from app.bot.flow import ask_dates, ask_slots, parse_date_range, parse_price_minor, parse_ru_date, parse_time_range
+from app.bot.flow import ask_dates, ask_slots, parse_price_minor, parse_ru_date
 from app.bot.keyboards import (
     ApptActCB,
-    BlockCB,
     ClientCB,
     DateCB,
-    DayCB,
     SlotCB,
     SvcActCB,
     appointment_actions_kb,
     master_days_kb,
     master_main_kb,
-    schedule_menu_kb,
-    weekdays_kb,
 )
 from app.models import (
     Appointment,
     AppointmentStatus,
     Business,
     Client,
-    DateOverride,
+    DayWindow,
     Service,
-    TimeBlock,
-    WorkSchedule,
 )
 from app.services.booking import (
     SLOT_TAKEN_MESSAGE,
@@ -46,7 +41,7 @@ from app.services.booking import (
     reschedule_appointment,
 )
 from app.services.formatting import WEEKDAYS_RU, appointment_card, format_price
-from app.services.slots import get_weekly_map
+
 
 router = Router()
 router.message.filter(RoleFilter("master"))
@@ -67,6 +62,9 @@ class MasterFSM(StatesGroup):
     block_hours = State()
     move_date = State()
     move_slot = State()
+    win_date = State()
+    win_times = State()
+    win_del_date = State()
 
 
 def _tz(business: Business) -> ZoneInfo:
@@ -231,6 +229,15 @@ async def master_move_date(
     ok = await ask_slots(callback.message, session, business, service, local_date, state)
     if not ok:
         await state.set_state(MasterFSM.move_date)
+    else:
+        await callback.message.answer(
+            "Дата не подошла?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Выбрать другую дату", callback_data="back:dates")]
+                ]
+            ),
+        )
     await callback.answer()
 
 
@@ -512,19 +519,7 @@ async def svc_edit(
 # --- расписание ---
 
 
-@router.message(F.text == "Расписание")
-async def schedule_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
-    await state.clear()
-    weekly = await get_weekly_map(session, business.id)
-    lines = ["Неделя:"]
-    for wd in range(7):
-        row = weekly.get(wd)
-        if row and row.is_working and row.start_time and row.end_time:
-            hours = f"{row.start_time.strftime('%H:%M')}–{row.end_time.strftime('%H:%M')}"
-        else:
-            hours = "выходной"
-        lines.append(f"{WEEKDAYS_RU[wd]}: {hours}")
-    await message.answer("\n".join(lines), reply_markup=schedule_menu_kb())
+
 
 
 @router.callback_query(F.data == "sch:hours")
@@ -773,4 +768,244 @@ async def sch_unblock_one(
     await session.delete(block)
     await session.commit()
     await callback.message.answer("Блокировка снята.")
+    await callback.answer()
+
+# --- окошки ---
+
+
+class WindowCB(CallbackData, prefix="win"):
+    id: int
+    d: str
+
+
+def _windows_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить день или времена", callback_data="winadd")],
+            [InlineKeyboardButton(text="🗑 Убрать окошко", callback_data="windel")],
+        ]
+    )
+
+
+def _local_to_utc(day: date, t: time, tz: ZoneInfo) -> datetime | None:
+    """Локальный момент в UTC; None, если момента не существует (разрыв DST)."""
+    naive = datetime.combine(day, t)
+    aware = naive.replace(tzinfo=tz)
+    back = aware.astimezone(timezone.utc).astimezone(tz)
+    if back.replace(tzinfo=None) != naive:
+        return None
+    return aware.astimezone(timezone.utc)
+
+
+def _parse_times(text: str) -> list[time] | None:
+    """Разбирает '10:30 14:00 17:30' или '10:30, 14:00'. None, если мусор."""
+    parts = (text or "").replace(",", " ").split()
+    if not parts:
+        return None
+    result: list[time] = []
+    for p in parts:
+        bits = p.split(":")
+        if len(bits) != 2:
+            return None
+        try:
+            hh, mm = int(bits[0]), int(bits[1])
+        except ValueError:
+            return None
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        result.append(time(hh, mm))
+    return result
+
+
+async def _windows_summary(session: AsyncSession, business: Business) -> str:
+    """Вид 'как в сторис': даты со временами, занятые помечены."""
+    tz = _tz(business)
+    today = datetime.now(tz).date()
+    last = today + timedelta(days=business.max_booking_days - 1)
+    windows = (
+        await session.scalars(
+            select(DayWindow)
+            .where(
+                DayWindow.business_id == business.id,
+                DayWindow.date >= today,
+                DayWindow.date <= last,
+            )
+            .order_by(DayWindow.starts_at)
+        )
+    ).all()
+    if not windows:
+        return "Окошек пока нет. Нажми «Добавить день или времена»."
+    day_start = datetime.combine(today, time.min, tzinfo=tz).astimezone(timezone.utc)
+    day_end = datetime.combine(last + timedelta(days=1), time.min, tzinfo=tz).astimezone(timezone.utc)
+    appts = (
+        await session.scalars(
+            select(Appointment).where(
+                Appointment.business_id == business.id,
+                Appointment.status == AppointmentStatus.confirmed,
+                Appointment.starts_at >= day_start,
+                Appointment.starts_at < day_end,
+            )
+        )
+    ).all()
+    booked = {a.starts_at for a in appts}
+    lines: list[str] = ["Окошки на ближайшие дни:"]
+    current: date | None = None
+    for w in windows:
+        if w.date != current:
+            current = w.date
+            lines.append(f"{WEEKDAYS_RU[current.weekday()]} {current.strftime('%d.%m')}:")
+        mark = " 🔒" if w.starts_at in booked else ""
+        lines.append(f"   {w.starts_at.astimezone(tz).strftime('%H:%M')}{mark}")
+    return "\n".join(lines)
+
+
+@router.message(F.text == "Окошки")
+async def windows_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    await state.clear()
+    await message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+
+
+@router.callback_query(F.data == "winadd")
+async def win_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MasterFSM.win_date)
+    await callback.message.answer(
+        "Дата дня окошек (ДД.ММ.ГГГГ). Если день уже есть, времена добавятся к нему."
+    )
+    await callback.answer()
+
+
+@router.message(MasterFSM.win_date, F.text)
+async def win_date_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    day = parse_ru_date(message.text or "")
+    if day is None:
+        await message.answer("Не понял дату. Пример: 10.10.2026")
+        return
+    tz = _tz(business)
+    today = datetime.now(tz).date()
+    last = today + timedelta(days=business.max_booking_days - 1)
+    if day < today or day > last:
+        await message.answer(
+            f"Окошки можно выкладывать с {today.strftime('%d.%m')} по {last.strftime('%d.%m')}."
+        )
+        return
+    await state.update_data(win_date=day.isoformat())
+    await state.set_state(MasterFSM.win_times)
+    await message.answer("Времена через пробел или запятую, например: 10:30 14:00 17:30")
+
+
+@router.message(MasterFSM.win_times, F.text)
+async def win_times_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    times = _parse_times(message.text or "")
+    if times is None:
+        await message.answer("Формат: 10:30 14:00 17:30")
+        return
+    data = await state.get_data()
+    day = datetime.strptime(data["win_date"], "%Y-%m-%d").date()
+    tz = _tz(business)
+    added = skipped_dup = skipped_dst = 0
+    for t in times:
+        aware_utc = _local_to_utc(day, t, tz)
+        if aware_utc is None:
+            skipped_dst += 1
+            continue
+        exists = await session.scalar(
+            select(DayWindow.id).where(
+                DayWindow.business_id == business.id,
+                DayWindow.starts_at == aware_utc,
+            )
+        )
+        if exists:
+            skipped_dup += 1
+            continue
+        session.add(DayWindow(business_id=business.id, date=day, starts_at=aware_utc))
+        added += 1
+    await session.commit()
+    await state.clear()
+    msg = f"Добавлено окошек: {added}."
+    if skipped_dup:
+        msg += f" Уже были: {skipped_dup}."
+    if skipped_dst:
+        msg += f" Пропущено несуществующее время: {skipped_dst}."
+    await message.answer(msg + "\n\n" + await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+
+
+@router.callback_query(F.data == "windel")
+async def win_del_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MasterFSM.win_del_date)
+    await callback.message.answer("Дата, с которой убрать окошки (ДД.ММ.ГГГГ):")
+    await callback.answer()
+
+
+@router.message(MasterFSM.win_del_date, F.text)
+async def win_del_date_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    day = parse_ru_date(message.text or "")
+    if day is None:
+        await message.answer("Не понял дату. Пример: 10.10.2026")
+        return
+    windows = (
+        await session.scalars(
+            select(DayWindow)
+            .where(DayWindow.business_id == business.id, DayWindow.date == day)
+            .order_by(DayWindow.starts_at)
+        )
+    ).all()
+    if not windows:
+        await state.clear()
+        await message.answer("На эту дату окошек нет.")
+        return
+    tz = _tz(business)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"✖ {w.starts_at.astimezone(tz).strftime('%H:%M')}",
+                callback_data=WindowCB(id=w.id, d=day.isoformat()).pack(),
+            )
+        ]
+        for w in windows
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="🗑 Очистить день целиком", callback_data=WindowCB(id=0, d=day.isoformat()).pack())]
+    )
+    await state.clear()
+    await message.answer(
+        f"Окошки на {day.strftime('%d.%m.%Y')}. Нажми, чтобы убрать:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(WindowCB.filter())
+async def win_delete(
+    callback: CallbackQuery,
+    callback_data: WindowCB,
+    session: AsyncSession,
+    business: Business,
+):
+    day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
+    if callback_data.id == 0:
+        rows = (
+            await session.scalars(
+                select(DayWindow).where(
+                    DayWindow.business_id == business.id,
+                    DayWindow.date == day,
+                )
+            )
+        ).all()
+        for w in rows:
+            await session.delete(w)
+        await session.commit()
+        await callback.message.answer(f"День {day.strftime('%d.%m')} очищен.")
+    else:
+        w = await session.scalar(
+            select(DayWindow).where(
+                DayWindow.id == callback_data.id,
+                DayWindow.business_id == business.id,
+            )
+        )
+        if w is None:
+            await callback.answer("Уже убрано", show_alert=True)
+            return
+        await session.delete(w)
+        await session.commit()
+        await callback.message.answer("Окошко убрано.")
+    await callback.message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
     await callback.answer()

@@ -146,6 +146,23 @@ class TimeBlock(Base):
     reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+class DayWindow(Base):
+    __tablename__ = "day_windows"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    business_id: Mapped[int] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), index=True
+    )
+    date: Mapped[date] = mapped_column(Date)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("business_id", "starts_at", name="uq_day_windows_business_starts"),
+        Index("ix_day_windows_business_date", "business_id", "date"),
+    )
 
 class Appointment(Base):
     __tablename__ = "appointments"

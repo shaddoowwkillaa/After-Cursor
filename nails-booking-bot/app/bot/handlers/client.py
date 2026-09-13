@@ -4,12 +4,9 @@ from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import DBAPIError
-from app.services.booking import is_slot_conflict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.filters import RoleFilter
@@ -31,6 +28,7 @@ from app.services.booking import (
     SLOT_TAKEN_MESSAGE,
     cancel_appointment,
     create_appointment,
+    is_slot_conflict,
     reschedule_appointment,
 )
 from app.services.formatting import appointment_card, format_price
@@ -38,6 +36,8 @@ from app.services.formatting import appointment_card, format_price
 router = Router()
 router.message.filter(RoleFilter("client"))
 router.callback_query.filter(RoleFilter("client"))
+
+BACK_TO_DATES = "back:dates"
 
 
 class BookFSM(StatesGroup):
@@ -52,6 +52,14 @@ class BookFSM(StatesGroup):
 class MoveFSM(StatesGroup):
     choosing_date = State()
     choosing_slot = State()
+
+
+def _back_dates_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Выбрать другую дату", callback_data=BACK_TO_DATES)]
+        ]
+    )
 
 
 async def _client(session: AsyncSession, business: Business, telegram_id: int) -> Client | None:
@@ -140,6 +148,20 @@ async def book_date(
     ok = await ask_slots(callback.message, session, business, service, local_date, state)
     if not ok:
         await state.set_state(BookFSM.choosing_date)
+    else:
+        await callback.message.answer("Дата не подошла?", reply_markup=_back_dates_kb())
+    await callback.answer()
+
+
+@router.callback_query(BookFSM.choosing_slot, F.data == BACK_TO_DATES)
+async def book_back_to_dates(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    await state.set_state(BookFSM.choosing_date)
+    await ask_dates(callback.message, session, business, state)
     await callback.answer()
 
 
@@ -339,6 +361,20 @@ async def move_date(
     ok = await ask_slots(callback.message, session, business, service, local_date, state)
     if not ok:
         await state.set_state(MoveFSM.choosing_date)
+    else:
+        await callback.message.answer("Дата не подошла?", reply_markup=_back_dates_kb())
+    await callback.answer()
+
+
+@router.callback_query(MoveFSM.choosing_slot, F.data == BACK_TO_DATES)
+async def move_back_to_dates(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    await state.set_state(MoveFSM.choosing_date)
+    await ask_dates(callback.message, session, business, state)
     await callback.answer()
 
 
