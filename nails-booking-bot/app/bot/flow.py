@@ -7,6 +7,11 @@ from app.bot.keyboards import dates_kb, slots_kb
 from app.models import Business, Service
 from app.services.slots import get_bookable_dates, get_free_slots
 
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from app.bot.keyboards import SlotCB, dates_kb
+from app.services.slots import get_bookable_dates, get_day_windows
+
 
 async def ask_dates(message, session: AsyncSession, business: Business, state: FSMContext) -> bool:
     today = datetime.now().astimezone().date()
@@ -31,13 +36,25 @@ async def ask_slots(
     local_date: date,
     state: FSMContext,
 ) -> bool:
-    slots = await get_free_slots(session, business, service, local_date)
-    if not slots:
-        await message.answer("На эту дату свободных слотов нет. Выберите другую дату.")
+    from zoneinfo import ZoneInfo
+
+    windows = await get_day_windows(session, business, local_date, service)
+    visible = [w for w in windows if w["reason"] != "past"]
+    if not visible:
+        await message.answer("На эту дату свободных окошек нет. Выберите другую дату.")
         return False
+    tz = ZoneInfo(business.timezone)
+    builder = InlineKeyboardBuilder()
+    for w in visible:
+        label = w["starts_at"].astimezone(tz).strftime("%H:%M")
+        if w["is_free"]:
+            builder.button(text=label, callback_data=SlotCB(ts=int(w["starts_at"].timestamp())).pack())
+        else:
+            builder.button(text=f"{label} 🔒")
+    builder.adjust(4)
     await message.answer(
         f"Свободное время на {local_date.strftime('%d.%m.%Y')}:",
-        reply_markup=slots_kb(slots, business.timezone),
+        reply_markup=builder.as_markup(),
     )
     return True
 

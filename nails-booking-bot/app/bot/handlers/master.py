@@ -13,6 +13,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import DBAPIError
 from app.services.booking import is_slot_conflict
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.services.slots import get_day_windows
 
 from app.bot.filters import RoleFilter
 from app.bot.flow import ask_dates, ask_slots, parse_price_minor, parse_ru_date
@@ -617,26 +618,19 @@ async def _windows_summary(session: AsyncSession, business: Business) -> str:
     ).all()
     if not windows:
         return "Окошек пока нет. Нажми «Добавить день или времена»."
-    day_start = datetime.combine(today, time.min, tzinfo=tz).astimezone(timezone.utc)
-    day_end = datetime.combine(last + timedelta(days=1), time.min, tzinfo=tz).astimezone(timezone.utc)
-    appts = (
-        await session.scalars(
-            select(Appointment).where(
-                Appointment.business_id == business.id,
-                Appointment.status == AppointmentStatus.confirmed,
-                Appointment.starts_at >= day_start,
-                Appointment.starts_at < day_end,
-            )
-        )
-    ).all()
-    booked = {a.starts_at for a in appts}
+    busy_ids: set[int] = set()
+    for d in sorted({w.date for w in windows}):
+        day_items = await get_day_windows(session, business, d, None)
+        for item in day_items:
+            if item["reason"] == "busy":
+                busy_ids.add(item["window"].id)
     lines: list[str] = ["Окошки на ближайшие дни:"]
     current: date | None = None
     for w in windows:
         if w.date != current:
             current = w.date
             lines.append(f"{WEEKDAYS_RU[current.weekday()]} {current.strftime('%d.%m')}:")
-        mark = " 🔒" if w.starts_at in booked else ""
+        mark = " 🔒" if w.id in busy_ids else ""
         lines.append(f"   {w.starts_at.astimezone(tz).strftime('%H:%M')}{mark}")
     return "\n".join(lines)
 
