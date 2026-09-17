@@ -17,11 +17,13 @@ from app.bot.keyboards import (
     DateCB,
     ServiceCB,
     SlotCB,
+    StaffCB,
     appointment_actions_kb,
     client_main_kb,
     confirm_kb,
     contact_kb,
     services_kb,
+    staff_kb,
 )
 from app.models import Appointment, AppointmentStatus, Business, Client, Service, Staff
 from app.services.booking import (
@@ -41,6 +43,7 @@ BACK_TO_DATES = "back:dates"
 
 
 class BookFSM(StatesGroup):
+    choosing_staff = State()
     choosing_service = State()
     choosing_date = State()
     choosing_slot = State()
@@ -71,31 +74,21 @@ async def _client(session: AsyncSession, business: Business, telegram_id: int) -
     )
 
 
-async def _service(session: AsyncSession, business_id: int, service_id: int) -> Service | None:
+async def _service(session: AsyncSession, staff_id: int, service_id: int) -> Service | None:
     return await session.scalar(
         select(Service).where(
-            Service.business_id == business_id,
+            Service.staff_id == staff_id,
             Service.id == service_id,
             Service.is_active.is_(True),
         )
     )
 
 
-async def _current_staff(session, business, telegram_id: int):
-    """Для мастера — его staff-строка; для клиента — owner бизнеса."""
-    staff = await session.scalar(
-        select(Staff).where(
-            Staff.business_id == business.id,
-            Staff.telegram_id == telegram_id,
-            Staff.is_active.is_(True),
-        )
-    )
-    if staff is not None:
-        return staff
+async def _staff(session: AsyncSession, business: Business, staff_id: int) -> Staff | None:
     return await session.scalar(
         select(Staff).where(
             Staff.business_id == business.id,
-            Staff.is_owner.is_(True),
+            Staff.id == staff_id,
             Staff.is_active.is_(True),
         )
     )
@@ -105,7 +98,7 @@ async def _current_staff(session, business, telegram_id: int):
 async def start(message: Message, business: Business, state: FSMContext):
     await state.clear()
     await message.answer(
-        f"Здравствуйте! Это запись к мастеру «{business.name}».\n"
+        f"Здравствуйте! Это запись в салон «{business.name}».\n"
         "Выберите действие:",
         reply_markup=client_main_kb(),
     )
@@ -118,19 +111,71 @@ async def cancel_flow(message: Message, business: Business, state: FSMContext):
 
 
 @router.message(F.text == "Записаться")
-async def start_booking(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def start_booking(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    staff_list = (
+        await session.scalars(
+            select(Staff)
+            .where(Staff.business_id == business.id, Staff.is_active.is_(True))
+            .order_by(Staff.id)
+        )
+    ).all()
+    if not staff_list:
+        await message.answer("Пока нет доступных мастеров.")
+        return
+    if len(staff_list) == 1:
+        # Если мастер один — пропускаем выбор, сразу к услугам
+        await state.update_data(staff_id=staff_list[0].id)
+        await _show_services_for_staff(message, session, business, staff_list[0], state)
+        return
+    await state.set_state(BookFSM.choosing_staff)
+    await message.answer("Выберите мастера:", reply_markup=staff_kb(staff_list))
+
+
+@router.callback_query(BookFSM.choosing_staff, StaffCB.filter())
+async def book_staff(
+    callback: CallbackQuery,
+    callback_data: StaffCB,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    staff = await _staff(session, business, callback_data.id)
+    if staff is None:
+        await callback.answer("Мастер недоступен", show_alert=True)
+        return
+    await state.update_data(staff_id=staff.id)
+    await _show_services_for_staff(callback.message, session, business, staff, state)
+    await callback.answer()
+
+
+async def _show_services_for_staff(
+    message, session: AsyncSession, business: Business, staff: Staff, state: FSMContext
+):
     services = (
         await session.scalars(
             select(Service)
-            .where(Service.business_id == business.id, Service.is_active.is_(True))
+            .where(
+                Service.business_id == business.id,
+                Service.staff_id == staff.id,
+                Service.is_active.is_(True),
+            )
             .order_by(Service.position, Service.id)
         )
     ).all()
     if not services:
-        await message.answer("Пока нет доступных услуг.")
+        await message.answer(f"У мастера {staff.name} пока нет доступных услуг.")
+        await state.clear()
         return
     await state.set_state(BookFSM.choosing_service)
-    await message.answer("Выберите услугу:", reply_markup=services_kb(services))
+    await message.answer(
+        f"Мастер: {staff.name}\nВыберите услугу:",
+        reply_markup=services_kb(services),
+    )
 
 
 @router.callback_query(BookFSM.choosing_service, ServiceCB.filter())
@@ -141,11 +186,12 @@ async def book_service(
     business: Business,
     state: FSMContext,
 ):
-    service = await _service(session, business.id, callback_data.id)
+    data = await state.get_data()
+    service = await _service(session, data["staff_id"], callback_data.id)
     if service is None:
         await callback.answer("Услуга недоступна", show_alert=True)
         return
-    staff = await _current_staff(session, business, callback.from_user.id)
+    staff = await _staff(session, business, data["staff_id"])
     await state.update_data(service_id=service.id)
     await state.set_state(BookFSM.choosing_date)
     await callback.message.answer(f"Услуга: {service.name} ({format_price(service.price_minor)})")
@@ -162,8 +208,8 @@ async def book_date(
     state: FSMContext,
 ):
     data = await state.get_data()
-    service = await _service(session, business.id, data["service_id"])
-    staff = await _current_staff(session, business, callback.from_user.id)
+    service = await _service(session, data["staff_id"], data["service_id"])
+    staff = await _staff(session, business, data["staff_id"])
     local_date = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     await state.update_data(local_date=callback_data.d)
     await state.set_state(BookFSM.choosing_slot)
@@ -182,8 +228,9 @@ async def book_back_to_dates(
     business: Business,
     state: FSMContext,
 ):
+    data = await state.get_data()
+    staff = await _staff(session, business, data["staff_id"])
     await state.set_state(BookFSM.choosing_date)
-    staff = await _current_staff(session, business, callback.from_user.id)
     await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
@@ -236,7 +283,7 @@ async def book_phone_text(message: Message, state: FSMContext, session, business
 
 async def _save_phone_and_confirm(message, state, session, business, phone: str):
     data = await state.get_data()
-    service = await _service(session, business.id, data["service_id"])
+    service = await _service(session, data["staff_id"], data["service_id"])
     starts_at = datetime.fromisoformat(data["starts_at"])
     await state.update_data(phone=phone)
     await state.set_state(BookFSM.confirming)
@@ -284,8 +331,8 @@ async def book_confirm(
         await session.flush()
     client.full_name = data["full_name"]
     client.phone = data["phone"]
-    service = await _service(session, business.id, data["service_id"])
-    staff = await _current_staff(session, business, user.id)
+    service = await _service(session, data["staff_id"], data["service_id"])
+    staff = await _staff(session, business, data["staff_id"])
     starts_at = datetime.fromisoformat(data["starts_at"])
 
     try:
@@ -350,6 +397,7 @@ async def client_cancel(
     if appt is None:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    # Пока уведомление летит owner-у; на Шаге 6 заменим на staff записи
     await cancel_appointment(session, business, appt, business.owner_telegram_id)
     await callback.message.answer("Запись отменена.", reply_markup=client_main_kb())
     await callback.answer()
@@ -368,9 +416,16 @@ async def client_reschedule_start(
     if appt is None:
         await callback.answer("Запись не найдена", show_alert=True)
         return
-    staff = await _current_staff(session, business, user.id)
+    staff = await _staff(session, business, appt.staff_id)
+    if staff is None:
+        await callback.answer("Мастер недоступен", show_alert=True)
+        return
     await state.set_state(MoveFSM.choosing_date)
-    await state.update_data(appointment_id=appt.id, service_id=appt.service_id)
+    await state.update_data(
+        appointment_id=appt.id,
+        service_id=appt.service_id,
+        staff_id=staff.id,
+    )
     await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
@@ -384,8 +439,8 @@ async def move_date(
     state: FSMContext,
 ):
     data = await state.get_data()
-    service = await _service(session, business.id, data["service_id"])
-    staff = await _current_staff(session, business, callback.from_user.id)
+    service = await _service(session, data["staff_id"], data["service_id"])
+    staff = await _staff(session, business, data["staff_id"])
     local_date = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     await state.update_data(local_date=callback_data.d)
     await state.set_state(MoveFSM.choosing_slot)
@@ -404,8 +459,9 @@ async def move_back_to_dates(
     business: Business,
     state: FSMContext,
 ):
+    data = await state.get_data()
+    staff = await _staff(session, business, data["staff_id"])
     await state.set_state(MoveFSM.choosing_date)
-    staff = await _current_staff(session, business, callback.from_user.id)
     await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
@@ -432,7 +488,7 @@ async def move_slot(
         return
     starts_at = datetime.fromtimestamp(callback_data.ts, tz=timezone.utc)
     client = await _client(session, business, user.id)
-    staff = await _current_staff(session, business, user.id)
+    staff = await _staff(session, business, appt.staff_id)
     try:
         appt = await reschedule_appointment(session, business, appt, client, appt.service, starts_at)
     except DBAPIError as exc:

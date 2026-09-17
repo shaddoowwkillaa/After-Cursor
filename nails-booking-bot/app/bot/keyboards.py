@@ -94,6 +94,8 @@ class ClientCB(CallbackData, prefix="cl"):
 class BlockCB(CallbackData, prefix="tb"):
     id: int
 
+class StaffCB(CallbackData, prefix="staff"):
+    id: int
 
 def services_kb(services: list[Service]) -> InlineKeyboardMarkup:
     rows = [
@@ -107,6 +109,18 @@ def services_kb(services: list[Service]) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def staff_kb(staff_list) -> InlineKeyboardMarkup:
+    """Кнопки выбора мастера для клиента."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=s.name,
+                callback_data=StaffCB(id=s.id).pack(),
+            )
+        ]
+        for s in staff_list
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def dates_kb(dates: list[date]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
