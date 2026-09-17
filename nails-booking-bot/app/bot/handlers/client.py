@@ -32,6 +32,7 @@ from app.services.booking import (
     reschedule_appointment,
 )
 from app.services.formatting import appointment_card, format_price
+from app.models import Staff
 
 router = Router()
 router.message.filter(RoleFilter("client"))
@@ -70,6 +71,24 @@ async def _client(session: AsyncSession, business: Business, telegram_id: int) -
         )
     )
 
+async def _current_staff(session, business, telegram_id: int):
+    """Для мастера — его staff-строка; для клиента — owner бизнеса."""
+    staff = await session.scalar(
+        select(Staff).where(
+            Staff.business_id == business.id,
+            Staff.telegram_id == telegram_id,
+            Staff.is_active.is_(True),
+        )
+    )
+    if staff is not None:
+        return staff
+    return await session.scalar(
+        select(Staff).where(
+            Staff.business_id == business.id,
+            Staff.is_owner.is_(True),
+            Staff.is_active.is_(True),
+        )
+    )
 
 async def _service(session: AsyncSession, business_id: int, service_id: int) -> Service | None:
     return await session.scalar(

@@ -20,6 +20,7 @@ def _exists_local(local_date: date, local_time: time, tz: ZoneInfo) -> datetime 
 async def get_day_windows(
     session: AsyncSession,
     business: Business,
+    staff,
     local_date: date,
     service: Service | None = None,
 ) -> list[dict]:
@@ -45,6 +46,7 @@ async def get_day_windows(
             select(DayWindow)
             .where(
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
                 DayWindow.starts_at >= day_start_utc,
                 DayWindow.starts_at < day_end_utc,
             )
@@ -99,18 +101,20 @@ async def get_day_windows(
 async def get_free_slots(
     session: AsyncSession,
     business: Business,
+    staff,
     service: Service,
     local_date: date,
     now_utc: datetime | None = None,
 ) -> list[datetime]:
     """Свободные окошки для записи (совместимый API)."""
-    windows = await get_day_windows(session, business, local_date, service)
+    windows = await get_day_windows(session, business, staff, local_date, service)
     return [w["starts_at"] for w in windows if w["is_free"]]
 
 
 async def get_bookable_dates(
     session: AsyncSession,
     business: Business,
+    staff,
     today: date,
 ) -> list[date]:
     """Даты горизонта, где есть хотя бы одно свободное окошко."""
@@ -119,6 +123,7 @@ async def get_bookable_dates(
         await session.scalars(
             select(DayWindow).where(
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
                 DayWindow.date >= today,
                 DayWindow.date <= last,
             )
@@ -126,7 +131,7 @@ async def get_bookable_dates(
     ).all()
     bookable: list[date] = []
     for d in sorted({w.date for w in windows}):
-        items = await get_day_windows(session, business, d, None)
+        items = await get_day_windows(session, business, staff, d, None)
         if any(item["is_free"] for item in items):
             bookable.append(d)
     return bookable

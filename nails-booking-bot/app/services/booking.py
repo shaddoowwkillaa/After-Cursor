@@ -104,6 +104,7 @@ async def cancel_pending_reminders(session: AsyncSession, appointment_id: int) -
 async def create_appointment(
     session: AsyncSession,
     business: Business,
+    staff,
     client: Client,
     service: Service,
     starts_at: datetime,
@@ -117,6 +118,7 @@ async def create_appointment(
         starts_at=starts_at,
         ends_at=ends_at,
         status=AppointmentStatus.confirmed,
+        staff_id=staff.id,
     )
     session.add(appointment)
     await session.flush()

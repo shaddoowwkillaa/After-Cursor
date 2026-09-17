@@ -43,12 +43,30 @@ from app.services.booking import (
     reschedule_appointment,
 )
 from app.services.formatting import WEEKDAYS_RU, appointment_card, format_price
-
+from app.models import Staff
 
 router = Router()
 router.message.filter(RoleFilter("master"))
 router.callback_query.filter(RoleFilter("master"))
 
+async def _current_staff(session, business, telegram_id: int):
+    """Для мастера — его staff-строка; для клиента — owner бизнеса."""
+    staff = await session.scalar(
+        select(Staff).where(
+            Staff.business_id == business.id,
+            Staff.telegram_id == telegram_id,
+            Staff.is_active.is_(True),
+        )
+    )
+    if staff is not None:
+        return staff
+    return await session.scalar(
+        select(Staff).where(
+            Staff.business_id == business.id,
+            Staff.is_owner.is_(True),
+            Staff.is_active.is_(True),
+        )
+    )
 
 class MasterFSM(StatesGroup):
     pick_day = State()
