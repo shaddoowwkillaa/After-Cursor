@@ -61,7 +61,7 @@ class Business(Base):
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Minsk")
     slot_step_minutes: Mapped[int] = mapped_column(Integer, default=15)
     min_notice_minutes: Mapped[int] = mapped_column(Integer, default=60)
-    max_booking_days: Mapped[int] = mapped_column(Integer, default=30)
+    max_booking_days: Mapped[int] = mapped_column(Integer, default=60)
     reminder_offsets_minutes: Mapped[list] = mapped_column(JSONB, default=lambda: [1440, 120])
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
