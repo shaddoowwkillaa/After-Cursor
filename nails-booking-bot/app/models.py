@@ -66,6 +66,24 @@ class Business(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+class Staff(Base):
+    __tablename__ = "staff"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    business_id: Mapped[int] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(100))
+    telegram_id: Mapped[int] = mapped_column(BigInteger)
+    is_owner: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("business_id", "telegram_id", name="uq_staff_business_telegram"),
+    )
 
 class Service(Base):
     __tablename__ = "services"
@@ -73,6 +91,9 @@ class Service(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     business_id: Mapped[int] = mapped_column(
         ForeignKey("businesses.id", ondelete="CASCADE"), index=True
+    )
+    staff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("staff.id", ondelete="CASCADE"), index=True, nullable=True
     )
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -154,6 +175,9 @@ class DayWindow(Base):
     business_id: Mapped[int] = mapped_column(
         ForeignKey("businesses.id", ondelete="CASCADE"), index=True
     )
+    staff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("staff.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     date: Mapped[date] = mapped_column(Date)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -171,6 +195,9 @@ class Appointment(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     business_id: Mapped[int] = mapped_column(
         ForeignKey("businesses.id", ondelete="CASCADE"), index=True
+    )
+    staff_id: Mapped[int] = mapped_column(
+        ForeignKey("staff.id", ondelete="RESTRICT"), index=True, nullable=True
     )
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"))
     service_id: Mapped[int] = mapped_column(ForeignKey("services.id", ondelete="RESTRICT"))
