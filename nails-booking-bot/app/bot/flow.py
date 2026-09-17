@@ -16,6 +16,7 @@ async def ask_dates(
     business: Business,
     staff: Staff,
     state: FSMContext,
+    extra_buttons: list | None = None,
 ) -> bool:
     today = datetime.now(ZoneInfo(business.timezone)).date()
     dates = await get_bookable_dates(session, business, staff, today)
@@ -23,7 +24,10 @@ async def ask_dates(
         await message.answer("Пока нет доступных дат для записи.")
         await state.clear()
         return False
-    await message.answer("Выберите дату:", reply_markup=dates_kb(dates))
+    markup = dates_kb(dates)
+    if extra_buttons:
+        markup.inline_keyboard.append(extra_buttons)
+    await message.answer("Выберите дату:", reply_markup=markup)
     return True
 
 

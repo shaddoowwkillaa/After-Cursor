@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -40,6 +40,7 @@ router.message.filter(RoleFilter("client"))
 router.callback_query.filter(RoleFilter("client"))
 
 BACK_TO_DATES = "back:dates"
+BACK_TO_STAFF = "back:staff"
 
 
 class BookFSM(StatesGroup):
@@ -60,7 +61,8 @@ class MoveFSM(StatesGroup):
 def _back_dates_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Выбрать другую дату", callback_data=BACK_TO_DATES)]
+            [InlineKeyboardButton(text="⬅️ Выбрать другую дату", callback_data=BACK_TO_DATES)],
+            [InlineKeyboardButton(text="⬅️ Выбрать другого мастера", callback_data=BACK_TO_STAFF)],
         ]
     )
 
@@ -132,8 +134,15 @@ async def start_booking(
         await state.update_data(staff_id=staff_list[0].id)
         await _show_services_for_staff(message, session, business, staff_list[0], state)
         return
-    await state.set_state(BookFSM.choosing_staff)
-    await message.answer("Выберите мастера:", reply_markup=staff_kb(staff_list))
+    await state.set_state(BookFSM.choosing_service)
+    markup = services_kb(services)
+    markup.inline_keyboard.append(
+        [InlineKeyboardButton(text="⬅️ Выбрать другого мастера", callback_data=BACK_TO_STAFF)]
+    )
+    await message.answer(
+        f"Мастер: {staff.name}\nВыберите услугу:",
+        reply_markup=markup,
+    )
 
 
 @router.callback_query(BookFSM.choosing_staff, StaffCB.filter())
@@ -195,9 +204,38 @@ async def book_service(
     await state.update_data(service_id=service.id)
     await state.set_state(BookFSM.choosing_date)
     await callback.message.answer(f"Услуга: {service.name} ({format_price(service.price_minor)})")
-    await ask_dates(callback.message, session, business, staff, state)
+    await ask_dates(
+        callback.message,
+        session,
+        business,
+        staff,
+        state,
+        extra_buttons=[
+            InlineKeyboardButton(text="⬅️ Выбрать другого мастера", callback_data=BACK_TO_STAFF)
+        ],
+    )
     await callback.answer()
 
+@router.callback_query(
+    StateFilter(BookFSM.choosing_service, BookFSM.choosing_date, BookFSM.choosing_slot),
+    F.data == BACK_TO_STAFF,
+)
+async def book_back_to_staff(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    staff_list = (
+        await session.scalars(
+            select(Staff)
+            .where(Staff.business_id == business.id, Staff.is_active.is_(True))
+            .order_by(Staff.id)
+        )
+    ).all()
+    await state.set_state(BookFSM.choosing_staff)
+    await callback.message.answer("Выберите мастера:", reply_markup=staff_kb(staff_list))
+    await callback.answer()
 
 @router.callback_query(BookFSM.choosing_date, DateCB.filter())
 async def book_date(
