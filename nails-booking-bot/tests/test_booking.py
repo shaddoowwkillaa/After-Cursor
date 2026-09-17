@@ -13,6 +13,7 @@ from app.models import (
     NotificationType,
     RecipientType,
     Service,
+    Staff,
 )
 from app.services.booking import (
     cancel_appointment,
@@ -39,9 +40,23 @@ async def business(session):
 
 
 @pytest.fixture
-async def service(session, business):
+async def staff(session, business):
+    s = Staff(
+        business_id=business.id,
+        name="Anna",
+        telegram_id=business.owner_telegram_id,
+        is_owner=True,
+    )
+    session.add(s)
+    await session.flush()
+    return s
+
+
+@pytest.fixture
+async def service(session, business, staff):
     s = Service(
         business_id=business.id,
+        staff_id=staff.id,
         name="Маникюр",
         price_minor=2500,
         duration_minutes=90,
@@ -65,12 +80,13 @@ def _at(day: date, t: time, tz_name: str) -> datetime:
 
 
 @pytest.mark.asyncio
-async def test_create_appointment_builds_notifications(session, business, service, client):
+async def test_create_appointment_builds_notifications(session, business, staff, service, client):
     starts_at = _at(date(2027, 3, 10), time(10, 0), business.timezone)
-    appt = await create_appointment(session, business, client, service, starts_at)
+    appt = await create_appointment(session, business, staff, client, service, starts_at)
 
     assert appt.id is not None
     assert appt.status == AppointmentStatus.confirmed
+    assert appt.staff_id == staff.id
     assert appt.ends_at == starts_at + timedelta(minutes=service.duration_minutes)
 
     tasks = (
@@ -78,7 +94,6 @@ async def test_create_appointment_builds_notifications(session, business, servic
             select(NotificationTask).where(NotificationTask.appointment_id == appt.id)
         )
     ).all()
-    # одна new_booking мастеру + по напоминанию обоим получателям на каждый офсет
     assert len(tasks) == 5
     new_booking = [t for t in tasks if t.type == NotificationType.new_booking]
     assert len(new_booking) == 1
@@ -91,9 +106,9 @@ async def test_create_appointment_builds_notifications(session, business, servic
 
 
 @pytest.mark.asyncio
-async def test_cancel_appointment_kills_reminders(session, business, service, client):
+async def test_cancel_appointment_kills_reminders(session, business, staff, service, client):
     starts_at = _at(date(2027, 3, 10), time(10, 0), business.timezone)
-    appt = await create_appointment(session, business, client, service, starts_at)
+    appt = await create_appointment(session, business, staff, client, service, starts_at)
 
     await cancel_appointment(session, business, appt, business.owner_telegram_id)
     assert appt.status == AppointmentStatus.canceled
@@ -112,9 +127,9 @@ async def test_cancel_appointment_kills_reminders(session, business, service, cl
 
 
 @pytest.mark.asyncio
-async def test_reschedule_recreates_reminders(session, business, service, client):
+async def test_reschedule_recreates_reminders(session, business, staff, service, client):
     starts_at = _at(date(2027, 3, 10), time(10, 0), business.timezone)
-    appt = await create_appointment(session, business, client, service, starts_at)
+    appt = await create_appointment(session, business, staff, client, service, starts_at)
     new_starts = _at(date(2027, 3, 11), time(12, 0), business.timezone)
 
     appt = await reschedule_appointment(session, business, appt, client, service, new_starts)

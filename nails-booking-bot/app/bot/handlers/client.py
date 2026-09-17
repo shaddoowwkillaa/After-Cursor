@@ -23,7 +23,7 @@ from app.bot.keyboards import (
     contact_kb,
     services_kb,
 )
-from app.models import Appointment, AppointmentStatus, Business, Client, Service
+from app.models import Appointment, AppointmentStatus, Business, Client, Service, Staff
 from app.services.booking import (
     SLOT_TAKEN_MESSAGE,
     cancel_appointment,
@@ -32,7 +32,6 @@ from app.services.booking import (
     reschedule_appointment,
 )
 from app.services.formatting import appointment_card, format_price
-from app.models import Staff
 
 router = Router()
 router.message.filter(RoleFilter("client"))
@@ -71,6 +70,17 @@ async def _client(session: AsyncSession, business: Business, telegram_id: int) -
         )
     )
 
+
+async def _service(session: AsyncSession, business_id: int, service_id: int) -> Service | None:
+    return await session.scalar(
+        select(Service).where(
+            Service.business_id == business_id,
+            Service.id == service_id,
+            Service.is_active.is_(True),
+        )
+    )
+
+
 async def _current_staff(session, business, telegram_id: int):
     """Для мастера — его staff-строка; для клиента — owner бизнеса."""
     staff = await session.scalar(
@@ -87,15 +97,6 @@ async def _current_staff(session, business, telegram_id: int):
             Staff.business_id == business.id,
             Staff.is_owner.is_(True),
             Staff.is_active.is_(True),
-        )
-    )
-
-async def _service(session: AsyncSession, business_id: int, service_id: int) -> Service | None:
-    return await session.scalar(
-        select(Service).where(
-            Service.business_id == business_id,
-            Service.id == service_id,
-            Service.is_active.is_(True),
         )
     )
 
@@ -144,10 +145,11 @@ async def book_service(
     if service is None:
         await callback.answer("Услуга недоступна", show_alert=True)
         return
+    staff = await _current_staff(session, business, callback.from_user.id)
     await state.update_data(service_id=service.id)
     await state.set_state(BookFSM.choosing_date)
     await callback.message.answer(f"Услуга: {service.name} ({format_price(service.price_minor)})")
-    await ask_dates(callback.message, session, business, state)
+    await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
 
@@ -161,10 +163,11 @@ async def book_date(
 ):
     data = await state.get_data()
     service = await _service(session, business.id, data["service_id"])
+    staff = await _current_staff(session, business, callback.from_user.id)
     local_date = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     await state.update_data(local_date=callback_data.d)
     await state.set_state(BookFSM.choosing_slot)
-    ok = await ask_slots(callback.message, session, business, service, local_date, state)
+    ok = await ask_slots(callback.message, session, business, staff, service, local_date, state)
     if not ok:
         await state.set_state(BookFSM.choosing_date)
     else:
@@ -180,12 +183,10 @@ async def book_back_to_dates(
     state: FSMContext,
 ):
     await state.set_state(BookFSM.choosing_date)
-    await ask_dates(callback.message, session, business, state)
+    staff = await _current_staff(session, business, callback.from_user.id)
+    await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
-@router.callback_query(F.data == "slot:locked")
-async def slot_locked_client(callback: CallbackQuery):
-    await callback.answer("Это время уже занято.", show_alert=True)
 
 @router.callback_query(BookFSM.choosing_slot, SlotCB.filter())
 async def book_slot(callback: CallbackQuery, callback_data: SlotCB, state: FSMContext):
@@ -194,6 +195,11 @@ async def book_slot(callback: CallbackQuery, callback_data: SlotCB, state: FSMCo
     await state.set_state(BookFSM.entering_name)
     await callback.message.answer("Как к вам обращаться? Напишите имя.")
     await callback.answer()
+
+
+@router.callback_query(BookFSM.choosing_slot, F.data == "slot:locked")
+async def slot_locked_client(callback: CallbackQuery):
+    await callback.answer("Это время уже занято.", show_alert=True)
 
 
 @router.message(BookFSM.entering_name, F.text)
@@ -279,10 +285,11 @@ async def book_confirm(
     client.full_name = data["full_name"]
     client.phone = data["phone"]
     service = await _service(session, business.id, data["service_id"])
+    staff = await _current_staff(session, business, user.id)
     starts_at = datetime.fromisoformat(data["starts_at"])
 
     try:
-        appointment = await create_appointment(session, business, client, service, starts_at)
+        appointment = await create_appointment(session, business, staff, client, service, starts_at)
     except DBAPIError as exc:
         await session.rollback()
         if not is_slot_conflict(exc):
@@ -290,7 +297,7 @@ async def book_confirm(
         await state.set_state(BookFSM.choosing_slot)
         local_date = datetime.strptime(data["local_date"], "%Y-%m-%d").date()
         await callback.message.answer(SLOT_TAKEN_MESSAGE)
-        await ask_slots(callback.message, session, business, service, local_date, state)
+        await ask_slots(callback.message, session, business, staff, service, local_date, state)
         await callback.answer()
         return
 
@@ -361,9 +368,10 @@ async def client_reschedule_start(
     if appt is None:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    staff = await _current_staff(session, business, user.id)
     await state.set_state(MoveFSM.choosing_date)
     await state.update_data(appointment_id=appt.id, service_id=appt.service_id)
-    await ask_dates(callback.message, session, business, state)
+    await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
 
@@ -377,10 +385,11 @@ async def move_date(
 ):
     data = await state.get_data()
     service = await _service(session, business.id, data["service_id"])
+    staff = await _current_staff(session, business, callback.from_user.id)
     local_date = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     await state.update_data(local_date=callback_data.d)
     await state.set_state(MoveFSM.choosing_slot)
-    ok = await ask_slots(callback.message, session, business, service, local_date, state)
+    ok = await ask_slots(callback.message, session, business, staff, service, local_date, state)
     if not ok:
         await state.set_state(MoveFSM.choosing_date)
     else:
@@ -396,8 +405,14 @@ async def move_back_to_dates(
     state: FSMContext,
 ):
     await state.set_state(MoveFSM.choosing_date)
-    await ask_dates(callback.message, session, business, state)
+    staff = await _current_staff(session, business, callback.from_user.id)
+    await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
+
+
+@router.callback_query(MoveFSM.choosing_slot, F.data == "slot:locked")
+async def slot_locked_move(callback: CallbackQuery):
+    await callback.answer("Это время уже занято.", show_alert=True)
 
 
 @router.callback_query(MoveFSM.choosing_slot, SlotCB.filter())
@@ -417,17 +432,16 @@ async def move_slot(
         return
     starts_at = datetime.fromtimestamp(callback_data.ts, tz=timezone.utc)
     client = await _client(session, business, user.id)
+    staff = await _current_staff(session, business, user.id)
     try:
-        appt = await reschedule_appointment(
-            session, business, appt, client, appt.service, starts_at
-        )
+        appt = await reschedule_appointment(session, business, appt, client, appt.service, starts_at)
     except DBAPIError as exc:
         await session.rollback()
         if not is_slot_conflict(exc):
             raise
         await callback.message.answer(SLOT_TAKEN_MESSAGE)
         local_date = datetime.strptime(data["local_date"], "%Y-%m-%d").date()
-        await ask_slots(callback.message, session, business, appt.service, local_date, state)
+        await ask_slots(callback.message, session, business, staff, appt.service, local_date, state)
         await callback.answer()
         return
     await state.clear()

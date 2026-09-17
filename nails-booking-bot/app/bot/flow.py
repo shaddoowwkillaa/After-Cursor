@@ -1,22 +1,24 @@
 from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.keyboards import SlotCB, dates_kb
-from app.models import Business, Service
+from app.models import Business, Service, Staff
 from app.services.slots import get_bookable_dates, get_day_windows
 
 
-
-async def ask_dates(message, session: AsyncSession, business: Business, state: FSMContext) -> bool:
-    today = datetime.now().astimezone().date()
-    # «сегодня» мастера — в его зоне
-    from zoneinfo import ZoneInfo
-
+async def ask_dates(
+    message,
+    session: AsyncSession,
+    business: Business,
+    staff: Staff,
+    state: FSMContext,
+) -> bool:
     today = datetime.now(ZoneInfo(business.timezone)).date()
-    dates = await get_bookable_dates(session, business, today)
+    dates = await get_bookable_dates(session, business, staff, today)
     if not dates:
         await message.answer("Пока нет доступных дат для записи.")
         await state.clear()
@@ -29,13 +31,12 @@ async def ask_slots(
     message,
     session: AsyncSession,
     business: Business,
+    staff: Staff,
     service: Service,
     local_date: date,
     state: FSMContext,
 ) -> bool:
-    from zoneinfo import ZoneInfo
-
-    windows = await get_day_windows(session, business, local_date, service)
+    windows = await get_day_windows(session, business, staff, local_date, service)
     visible = [w for w in windows if w["reason"] != "past"]
     if not visible:
         await message.answer("На эту дату свободных окошек нет. Выберите другую дату.")
@@ -104,7 +105,6 @@ def parse_ru_date(text: str) -> date | None:
 def parse_date_range(text: str) -> tuple[date, date] | None:
     cleaned = text.strip().replace("–", "-").replace("—", "-")
     if "-" in cleaned and cleaned.count(".") >= 2:
-        # 10.09.2026-20.09.2026
         parts = [p.strip() for p in cleaned.split("-")]
         if len(parts) == 2:
             a, b = parse_ru_date(parts[0]), parse_ru_date(parts[1])

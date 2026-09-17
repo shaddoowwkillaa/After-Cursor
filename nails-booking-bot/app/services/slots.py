@@ -140,6 +140,7 @@ async def get_bookable_dates(
 async def add_day_window(
     session: AsyncSession,
     business: Business,
+    staff,
     local_date: date,
     local_time: time,
 ) -> DayWindow | None:
@@ -151,6 +152,7 @@ async def add_day_window(
 
     window = DayWindow(
         business_id=business.id,
+        staff_id=staff.id,
         date=local_date,
         starts_at=starts_at.astimezone(timezone.utc),
     )

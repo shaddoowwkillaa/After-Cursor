@@ -8,12 +8,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import DBAPIError
-from app.services.booking import is_slot_conflict
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.services.slots import get_day_windows
 
 from app.bot.filters import RoleFilter
 from app.bot.flow import ask_dates, ask_slots, parse_price_minor, parse_ru_date
@@ -35,22 +31,25 @@ from app.models import (
     Client,
     DayWindow,
     Service,
+    Staff,
 )
 from app.services.booking import (
     SLOT_TAKEN_MESSAGE,
     cancel_appointment,
     complete_appointment,
+    is_slot_conflict,
     reschedule_appointment,
 )
 from app.services.formatting import WEEKDAYS_RU, appointment_card, format_price
-from app.models import Staff
+from app.services.slots import get_day_windows
 
 router = Router()
 router.message.filter(RoleFilter("master"))
 router.callback_query.filter(RoleFilter("master"))
 
-async def _current_staff(session, business, telegram_id: int):
-    """Для мастера — его staff-строка; для клиента — owner бизнеса."""
+
+async def _current_staff(session, business, telegram_id: int) -> Staff | None:
+    """Возвращает staff по telegram_id; для клиента — owner бизнеса."""
     staff = await session.scalar(
         select(Staff).where(
             Staff.business_id == business.id,
@@ -67,6 +66,7 @@ async def _current_staff(session, business, telegram_id: int):
             Staff.is_active.is_(True),
         )
     )
+
 
 class MasterFSM(StatesGroup):
     pick_day = State()
@@ -118,16 +118,32 @@ async def appointments_menu(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "md:today")
-async def appts_today(callback: CallbackQuery, session: AsyncSession, business: Business):
+async def appts_today(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     day = datetime.now(_tz(business)).date()
-    await _send_day_appts(callback.message, session, business, day)
+    await _send_day_appts(callback.message, session, business, staff, day)
     await callback.answer()
 
 
 @router.callback_query(F.data == "md:tomorrow")
-async def appts_tomorrow(callback: CallbackQuery, session: AsyncSession, business: Business):
+async def appts_tomorrow(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     day = datetime.now(_tz(business)).date() + timedelta(days=1)
-    await _send_day_appts(callback.message, session, business, day)
+    await _send_day_appts(callback.message, session, business, staff, day)
     await callback.answer()
 
 
@@ -154,12 +170,18 @@ async def appts_picked(
     business: Business,
     state: FSMContext,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await state.clear()
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     await state.clear()
     day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
-    await _send_day_appts(callback.message, session, business, day)
+    await _send_day_appts(callback.message, session, business, staff, day)
     await callback.answer()
 
-async def _send_day_appts(message, session, business: Business, day):
+
+async def _send_day_appts(message, session, business: Business, staff: Staff, day):
     tz = _tz(business)
     start = datetime.combine(day, time.min, tzinfo=tz).astimezone(timezone.utc)
     end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz).astimezone(timezone.utc)
@@ -168,6 +190,7 @@ async def _send_day_appts(message, session, business: Business, day):
             select(Appointment)
             .where(
                 Appointment.business_id == business.id,
+                Appointment.staff_id == staff.id,
                 Appointment.starts_at >= start,
                 Appointment.starts_at < end,
                 Appointment.status != AppointmentStatus.canceled,
@@ -180,6 +203,7 @@ async def _send_day_appts(message, session, business: Business, day):
             select(DayWindow)
             .where(
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
                 DayWindow.date == day,
             )
             .order_by(DayWindow.starts_at)
@@ -224,7 +248,8 @@ async def master_cancel(
     session: AsyncSession,
     business: Business,
 ):
-    appt = await _business_appt(session, business.id, callback_data.id)
+    staff = await _current_staff(session, business, callback.from_user.id)
+    appt = await _staff_appt(session, business.id, staff.id if staff else 0, callback_data.id)
     if appt is None:
         await callback.answer("Не найдено", show_alert=True)
         return
@@ -240,7 +265,8 @@ async def master_done(
     session: AsyncSession,
     business: Business,
 ):
-    appt = await _business_appt(session, business.id, callback_data.id)
+    staff = await _current_staff(session, business, callback.from_user.id)
+    appt = await _staff_appt(session, business.id, staff.id if staff else 0, callback_data.id)
     if appt is None:
         await callback.answer("Не найдено", show_alert=True)
         return
@@ -257,13 +283,14 @@ async def master_move_start(
     business: Business,
     state: FSMContext,
 ):
-    appt = await _business_appt(session, business.id, callback_data.id)
+    staff = await _current_staff(session, business, callback.from_user.id)
+    appt = await _staff_appt(session, business.id, staff.id if staff else 0, callback_data.id)
     if appt is None:
         await callback.answer("Не найдено", show_alert=True)
         return
     await state.set_state(MasterFSM.move_date)
     await state.update_data(appointment_id=appt.id, service_id=appt.service_id)
-    await ask_dates(callback.message, session, business, state)
+    await ask_dates(callback.message, session, business, staff, state)
     await callback.answer()
 
 
@@ -275,14 +302,27 @@ async def master_move_date(
     business: Business,
     state: FSMContext,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await state.clear()
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     data = await state.get_data()
     service = await session.scalar(
-        select(Service).where(Service.business_id == business.id, Service.id == data["service_id"])
+        select(Service).where(
+            Service.business_id == business.id,
+            Service.staff_id == staff.id,
+            Service.id == data["service_id"],
+        )
     )
+    if service is None:
+        await state.clear()
+        await callback.answer("Услуга недоступна", show_alert=True)
+        return
     local_date = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     await state.update_data(local_date=callback_data.d)
     await state.set_state(MasterFSM.move_slot)
-    ok = await ask_slots(callback.message, session, business, service, local_date, state)
+    ok = await ask_slots(callback.message, session, business, staff, service, local_date, state)
     if not ok:
         await state.set_state(MasterFSM.move_date)
     else:
@@ -305,8 +345,13 @@ async def master_move_slot(
     business: Business,
     state: FSMContext,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await state.clear()
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     data = await state.get_data()
-    appt = await _business_appt(session, business.id, data["appointment_id"])
+    appt = await _staff_appt(session, business.id, staff.id, data["appointment_id"])
     if appt is None:
         await state.clear()
         await callback.answer("Не найдено", show_alert=True)
@@ -322,7 +367,7 @@ async def master_move_slot(
             raise
         await callback.message.answer(SLOT_TAKEN_MESSAGE)
         local_date = datetime.strptime(data["local_date"], "%Y-%m-%d").date()
-        await ask_slots(callback.message, session, business, appt.service, local_date, state)
+        await ask_slots(callback.message, session, business, staff, appt.service, local_date, state)
         await callback.answer()
         return
     await state.clear()
@@ -330,10 +375,33 @@ async def master_move_slot(
     await callback.answer()
 
 
-async def _business_appt(session, business_id, appointment_id) -> Appointment | None:
+@router.callback_query(MasterFSM.move_slot, F.data == "back:dates")
+async def master_move_back_to_dates(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await state.clear()
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(MasterFSM.move_date)
+    await ask_dates(callback.message, session, business, staff, state)
+    await callback.answer()
+
+
+@router.callback_query(MasterFSM.move_slot, F.data == "slot:locked")
+async def slot_locked_move_master(callback: CallbackQuery):
+    await callback.answer("Это время уже занято.", show_alert=True)
+
+
+async def _staff_appt(session, business_id, staff_id, appointment_id) -> Appointment | None:
     return await session.scalar(
         select(Appointment).where(
             Appointment.business_id == business_id,
+            Appointment.staff_id == staff_id,
             Appointment.id == appointment_id,
         )
     )
@@ -343,7 +411,12 @@ async def _business_appt(session, business_id, appointment_id) -> Appointment | 
 
 
 @router.message(F.text == "Клиенты")
-async def list_clients(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def list_clients(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     await state.clear()
     clients = (
         await session.scalars(
@@ -407,15 +480,26 @@ async def client_card(
 
 
 @router.message(F.text == "Услуги")
-async def list_services(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def list_services(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     await state.clear()
-    await _send_services(message, session, business)
+    staff = await _current_staff(session, business, message.from_user.id)
+    if staff is None:
+        await message.answer("Нет доступа.")
+        return
+    await _send_services(message, session, business, staff)
 
 
-async def _send_services(message, session, business):
+async def _send_services(message, session, business, staff: Staff):
     services = (
         await session.scalars(
-            select(Service).where(Service.business_id == business.id).order_by(Service.position, Service.id)
+            select(Service)
+            .where(Service.business_id == business.id, Service.staff_id == staff.id)
+            .order_by(Service.position, Service.id)
         )
     ).all()
     rows = [
@@ -460,7 +544,17 @@ async def svc_price(message: Message, state: FSMContext):
 
 
 @router.message(MasterFSM.svc_duration, F.text)
-async def svc_duration(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def svc_duration(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    staff = await _current_staff(session, business, message.from_user.id)
+    if staff is None:
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
     try:
         duration = int((message.text or "").strip())
     except ValueError:
@@ -472,7 +566,11 @@ async def svc_duration(message: Message, session: AsyncSession, business: Busine
     data = await state.get_data()
     if data.get("edit_id"):
         service = await session.scalar(
-            select(Service).where(Service.business_id == business.id, Service.id == data["edit_id"])
+            select(Service).where(
+                Service.business_id == business.id,
+                Service.staff_id == staff.id,
+                Service.id == data["edit_id"],
+            )
         )
         if service:
             service.name = data["svc_name"]
@@ -483,13 +581,14 @@ async def svc_duration(message: Message, session: AsyncSession, business: Busine
     else:
         max_pos = await session.scalar(
             select(Service.position)
-            .where(Service.business_id == business.id)
+            .where(Service.business_id == business.id, Service.staff_id == staff.id)
             .order_by(Service.position.desc())
             .limit(1)
         )
         session.add(
             Service(
                 business_id=business.id,
+                staff_id=staff.id,
                 name=data["svc_name"],
                 price_minor=data["price_minor"],
                 duration_minutes=duration,
@@ -509,8 +608,13 @@ async def svc_item(
     session: AsyncSession,
     business: Business,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
     service = await session.scalar(
-        select(Service).where(Service.business_id == business.id, Service.id == callback_data.id)
+        select(Service).where(
+            Service.business_id == business.id,
+            Service.staff_id == staff.id if staff else False,
+            Service.id == callback_data.id,
+        )
     )
     if service is None:
         await callback.answer("Не найдена", show_alert=True)
@@ -540,8 +644,13 @@ async def svc_toggle(
     session: AsyncSession,
     business: Business,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
     service = await session.scalar(
-        select(Service).where(Service.business_id == business.id, Service.id == callback_data.id)
+        select(Service).where(
+            Service.business_id == business.id,
+            Service.staff_id == staff.id if staff else False,
+            Service.id == callback_data.id,
+        )
     )
     if service is None:
         await callback.answer("Не найдена", show_alert=True)
@@ -560,8 +669,13 @@ async def svc_edit(
     business: Business,
     state: FSMContext,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
     service = await session.scalar(
-        select(Service).where(Service.business_id == business.id, Service.id == callback_data.id)
+        select(Service).where(
+            Service.business_id == business.id,
+            Service.staff_id == staff.id if staff else False,
+            Service.id == callback_data.id,
+        )
     )
     if service is None:
         await callback.answer("Не найдена", show_alert=True)
@@ -572,7 +686,6 @@ async def svc_edit(
     await callback.answer()
 
 
-# --- расписание ---
 # --- окошки ---
 
 
@@ -620,7 +733,7 @@ def _parse_times(text: str) -> list[time] | None:
     return result
 
 
-async def _windows_summary(session: AsyncSession, business: Business) -> str:
+async def _windows_summary(session: AsyncSession, business: Business, staff: Staff) -> str:
     """Вид 'как в сторис': даты со временами, занятые помечены."""
     tz = _tz(business)
     today = datetime.now(tz).date()
@@ -630,6 +743,7 @@ async def _windows_summary(session: AsyncSession, business: Business) -> str:
             select(DayWindow)
             .where(
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
                 DayWindow.date >= today,
                 DayWindow.date <= last,
             )
@@ -640,7 +754,7 @@ async def _windows_summary(session: AsyncSession, business: Business) -> str:
         return "Окошек пока нет. Нажми «Добавить день или времена»."
     busy_ids: set[int] = set()
     for d in sorted({w.date for w in windows}):
-        day_items = await get_day_windows(session, business, d, None)
+        day_items = await get_day_windows(session, business, staff, d, None)
         for item in day_items:
             if item["reason"] == "busy":
                 busy_ids.add(item["window"].id)
@@ -656,9 +770,18 @@ async def _windows_summary(session: AsyncSession, business: Business) -> str:
 
 
 @router.message(F.text == "Окошки")
-async def windows_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def windows_home(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     await state.clear()
-    await message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+    staff = await _current_staff(session, business, message.from_user.id)
+    if staff is None:
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await _windows_summary(session, business, staff), reply_markup=_windows_menu_kb())
 
 
 @router.callback_query(F.data == "winadd")
@@ -689,7 +812,17 @@ async def win_date_save(
 
 
 @router.message(MasterFSM.win_times, F.text)
-async def win_times_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def win_times_save(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    staff = await _current_staff(session, business, message.from_user.id)
+    if staff is None:
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
     times = _parse_times(message.text or "")
     if times is None:
         await message.answer("Формат: 10:30 14:00 17:30")
@@ -706,13 +839,21 @@ async def win_times_save(message: Message, session: AsyncSession, business: Busi
         exists = await session.scalar(
             select(DayWindow.id).where(
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
                 DayWindow.starts_at == aware_utc,
             )
         )
         if exists:
             skipped_dup += 1
             continue
-        session.add(DayWindow(business_id=business.id, date=day, starts_at=aware_utc))
+        session.add(
+            DayWindow(
+                business_id=business.id,
+                staff_id=staff.id,
+                date=day,
+                starts_at=aware_utc,
+            )
+        )
         added += 1
     await session.commit()
     await state.clear()
@@ -721,7 +862,10 @@ async def win_times_save(message: Message, session: AsyncSession, business: Busi
         msg += f" Уже были: {skipped_dup}."
     if skipped_dst:
         msg += f" Пропущено несуществующее время: {skipped_dst}."
-    await message.answer(msg + "\n\n" + await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+    await message.answer(
+        msg + "\n\n" + await _windows_summary(session, business, staff),
+        reply_markup=_windows_menu_kb(),
+    )
 
 
 @router.callback_query(F.data == "windel")
@@ -731,12 +875,17 @@ async def win_del_start(
     business: Business,
     state: FSMContext,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     today = datetime.now(_tz(business)).date()
     dates = (
         await session.scalars(
             select(DayWindow.date)
             .where(
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
                 DayWindow.date >= today,
             )
             .order_by(DayWindow.date)
@@ -759,11 +908,20 @@ async def win_del_date_save(
     business: Business,
     state: FSMContext,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await state.clear()
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     windows = (
         await session.scalars(
             select(DayWindow)
-            .where(DayWindow.business_id == business.id, DayWindow.date == day)
+            .where(
+                DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
+                DayWindow.date == day,
+            )
             .order_by(DayWindow.starts_at)
         )
     ).all()
@@ -804,12 +962,17 @@ async def win_delete(
     session: AsyncSession,
     business: Business,
 ):
+    staff = await _current_staff(session, business, callback.from_user.id)
+    if staff is None:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     day = datetime.strptime(callback_data.d, "%Y-%m-%d").date()
     if callback_data.id == 0:
         rows = (
             await session.scalars(
                 select(DayWindow).where(
                     DayWindow.business_id == business.id,
+                    DayWindow.staff_id == staff.id,
                     DayWindow.date == day,
                 )
             )
@@ -823,6 +986,7 @@ async def win_delete(
             select(DayWindow).where(
                 DayWindow.id == callback_data.id,
                 DayWindow.business_id == business.id,
+                DayWindow.staff_id == staff.id,
             )
         )
         if w is None:
@@ -831,12 +995,16 @@ async def win_delete(
         await session.delete(w)
         await session.commit()
         await callback.message.answer("Окошко убрано.")
-    await callback.message.answer(await _windows_summary(session, business), reply_markup=_windows_menu_kb())
+    await callback.message.answer(
+        await _windows_summary(session, business, staff), reply_markup=_windows_menu_kb()
+    )
     await callback.answer()
+
 
 @router.callback_query(F.data == "slot:locked")
 async def slot_locked_master(callback: CallbackQuery):
     await callback.answer("Это время уже занято.", show_alert=True)
+
 
 # --- настройки ---
 
@@ -868,7 +1036,12 @@ def _reminders_kb() -> InlineKeyboardMarkup:
 
 
 @router.message(F.text == "⚙️ Настройки")
-async def settings_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def settings_home(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     await state.clear()
     offsets = business.reminder_offsets_minutes or []
     kb = InlineKeyboardMarkup(
@@ -891,7 +1064,12 @@ async def set_name_start(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(MasterFSM.set_name, F.text)
-async def set_name_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def set_name_save(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     name = (message.text or "").strip()
     if len(name) < 2:
         await message.answer("Слишком коротко. Введите ещё раз.")
@@ -912,7 +1090,12 @@ async def set_rem_start(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("set:rem:"))
-async def set_rem_save(callback: CallbackQuery, session: AsyncSession, business: Business, state: FSMContext):
+async def set_rem_save(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     payload = callback.data[len("set:rem:"):]
     if payload == "custom":
         await state.set_state(MasterFSM.set_rem)
@@ -931,7 +1114,12 @@ async def set_rem_save(callback: CallbackQuery, session: AsyncSession, business:
 
 
 @router.message(MasterFSM.set_rem, F.text)
-async def set_rem_custom_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+async def set_rem_custom_save(
+    message: Message,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
     parts = (message.text or "").replace(" ", "").split(",")
     offsets: list[int] = []
     for p in parts:
