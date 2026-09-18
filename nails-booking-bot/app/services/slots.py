@@ -58,6 +58,7 @@ async def get_day_windows(
         await session.scalars(
             select(Appointment).where(
                 Appointment.business_id == business.id,
+                Appointment.staff_id == staff.id,
                 Appointment.status == AppointmentStatus.confirmed,
                 Appointment.starts_at < day_end_utc,
                 Appointment.ends_at > day_start_utc,
