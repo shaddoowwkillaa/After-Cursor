@@ -185,7 +185,7 @@ class DayWindow(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("business_id", "starts_at", name="uq_day_windows_business_starts"),
+        UniqueConstraint("staff_id", "starts_at", name="uq_day_windows_staff_starts"),
         Index("ix_day_windows_business_date", "business_id", "date"),
     )
 
