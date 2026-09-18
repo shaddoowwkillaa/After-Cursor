@@ -433,7 +433,9 @@ async def client_cancel(
         await callback.answer("Запись не найдена", show_alert=True)
         return
     # Пока уведомление летит owner-у; на Шаге 6 заменим на staff записи
-    await cancel_appointment(session, business, appt, business.owner_telegram_id)
+    staff = await _staff(session, business, appt.staff_id)
+    notify = staff.telegram_id if staff is not None else business.owner_telegram_id
+    await cancel_appointment(session, business, appt, notify)
     await callback.message.answer("Запись отменена.", reply_markup=client_main_kb())
     await callback.answer()
 

@@ -15,6 +15,7 @@ from app.models import (
     NotificationType,
     RecipientType,
     Service,
+    Staff,
 )
 from app.services.formatting import appointment_card
 
@@ -22,16 +23,7 @@ SLOT_TAKEN_MESSAGE = "Это время только что заняли, выб
 
 
 def is_slot_conflict(exc: BaseException) -> bool:
-    """True, если база не дала создать запись, потому что слот занят.
-
-    PostgreSQL отклоняет проигравшую транзакцию двумя способами:
-    - нарушение exclusion constraint (IntegrityError);
-    - deadlock между двумя одновременными вставками (DeadlockDetectedError).
-
-    SQLAlchemy-asyncpg заворачивает deadlock в свой адаптер-класс,
-    и имя класса asyncpg остаётся только в тексте сообщения,
-    поэтому дополнительно проверяем текст.
-    """
+    """True, если база не дала создать запись, потому что слот занят."""
     if isinstance(exc, IntegrityError):
         return True
     orig = getattr(exc, "orig", None)
@@ -63,13 +55,14 @@ def _add_reminders(
     business: Business,
     appointment: Appointment,
     client: Client,
+    master_telegram_id: int,
     now: datetime,
 ) -> None:
-    """Создаёт напоминания клиенту и мастеру по каждому офсету бизнеса."""
+    """Создаёт напоминания клиенту и мастеру записи по каждому офсету салона."""
     offsets = business.reminder_offsets_minutes or []
     recipients = [
         (RecipientType.client, client.telegram_id),
-        (RecipientType.master, business.owner_telegram_id),
+        (RecipientType.master, master_telegram_id),
     ]
     for offset in offsets:
         send_at = appointment.starts_at - timedelta(minutes=int(offset))
@@ -113,12 +106,12 @@ async def create_appointment(
     ends_at = starts_at + timedelta(minutes=service.duration_minutes)
     appointment = Appointment(
         business_id=business.id,
+        staff_id=staff.id,
         client_id=client.id,
         service_id=service.id,
         starts_at=starts_at,
         ends_at=ends_at,
         status=AppointmentStatus.confirmed,
-        staff_id=staff.id,
     )
     session.add(appointment)
     await session.flush()
@@ -128,14 +121,14 @@ async def create_appointment(
             business_id=business.id,
             appointment_id=appointment.id,
             recipient_type=RecipientType.master,
-            telegram_id=business.owner_telegram_id,
+            telegram_id=staff.telegram_id,
             type=NotificationType.new_booking,
             send_at=now,
             status=NotificationStatus.pending,
             card_text=appointment_card(appointment, business, service),
         )
     )
-    _add_reminders(session, business, appointment, client, now)
+    _add_reminders(session, business, appointment, client, staff.telegram_id, now)
     await session.commit()
     return appointment
 
@@ -149,13 +142,16 @@ async def cancel_appointment(
     now = datetime.now(timezone.utc)
     appointment.status = AppointmentStatus.canceled
     await cancel_pending_reminders(session, appointment.id)
+    recipient_type = (
+        RecipientType.client
+        if notify_telegram_id == appointment.client.telegram_id
+        else RecipientType.master
+    )
     session.add(
         NotificationTask(
             business_id=business.id,
             appointment_id=appointment.id,
-            recipient_type=RecipientType.master
-            if notify_telegram_id == business.owner_telegram_id
-            else RecipientType.client,
+            recipient_type=recipient_type,
             telegram_id=notify_telegram_id,
             type=NotificationType.canceled,
             send_at=now,
@@ -193,9 +189,10 @@ async def reschedule_appointment(
     appointment.status = AppointmentStatus.confirmed
     await session.flush()
     await cancel_pending_reminders(session, appointment.id)
-    _add_reminders(session, business, appointment, client, now)
+    staff_tid = await _staff_telegram(session, appointment, business)
+    _add_reminders(session, business, appointment, client, staff_tid, now)
     for telegram_id, recipient in (
-        (business.owner_telegram_id, RecipientType.master),
+        (staff_tid, RecipientType.master),
         (client.telegram_id, RecipientType.client),
     ):
         session.add(
@@ -212,3 +209,7 @@ async def reschedule_appointment(
         )
     await session.commit()
     return appointment
+
+async def _staff_telegram(session, appointment: Appointment, business: Business) -> int:
+    staff = await session.scalar(select(Staff).where(Staff.id == appointment.staff_id))
+    return staff.telegram_id if staff is not None else business.owner_telegram_id

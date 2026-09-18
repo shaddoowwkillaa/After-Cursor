@@ -44,7 +44,7 @@ async def staff(session, business):
     s = Staff(
         business_id=business.id,
         name="Anna",
-        telegram_id=business.owner_telegram_id,
+        telegram_id=777,
         is_owner=True,
     )
     session.add(s)
@@ -102,6 +102,11 @@ async def test_create_appointment_builds_notifications(session, business, staff,
     assert "Маникюр" in new_booking[0].card_text
     reminders = [t for t in tasks if t.type == NotificationType.reminder]
     assert len(reminders) == 4
+    assert new_booking[0].telegram_id == staff.telegram_id
+    master_reminders = [t for t in reminders if t.recipient_type == RecipientType.master]
+    client_reminders = [t for t in reminders if t.recipient_type == RecipientType.client]
+    assert all(t.telegram_id == staff.telegram_id for t in master_reminders)
+    assert all(t.telegram_id == client.telegram_id for t in client_reminders)
     assert all(t.status == NotificationStatus.pending for t in reminders)
 
 

@@ -1045,28 +1045,35 @@ def _reminders_kb() -> InlineKeyboardMarkup:
 
 
 @router.message(F.text == "⚙️ Настройки")
-async def settings_home(
-    message: Message,
-    session: AsyncSession,
-    business: Business,
-    state: FSMContext,
-):
+async def settings_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
     await state.clear()
     offsets = business.reminder_offsets_minutes or []
+    text = (
+        f"Настройки кабинета:\nИмя: {business.name}\n"
+        f"Напоминания: {_offsets_human(list(offsets))}"
+    )
+    if not await _is_owner(session, business, message.from_user.id):
+        await message.answer(text + "\n\nНастройки салона меняет владелец.")
+        return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Название кабинета", callback_data="set:name")],
             [InlineKeyboardButton(text="🔔 Напоминания", callback_data="set:rem")],
         ]
     )
-    await message.answer(
-        f"Настройки кабинета:\nИмя: {business.name}\nНапоминания: {_offsets_human(list(offsets))}",
-        reply_markup=kb,
-    )
+    await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "set:name")
-async def set_name_start(callback: CallbackQuery, state: FSMContext):
+async def set_name_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    if not await _is_owner(session, business, callback.from_user.id):
+        await callback.answer("Настройки меняет владелец", show_alert=True)
+        return
     await state.set_state(MasterFSM.set_name)
     await callback.message.answer("Новое название кабинета (до 100 символов):")
     await callback.answer()
@@ -1093,7 +1100,14 @@ async def set_name_save(
 
 
 @router.callback_query(F.data == "set:rem")
-async def set_rem_start(callback: CallbackQuery):
+async def set_rem_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+):
+    if not await _is_owner(session, business, callback.from_user.id):
+        await callback.answer("Настройки меняет владелец", show_alert=True)
+        return
     await callback.message.answer("Когда напоминать о визите?", reply_markup=_reminders_kb())
     await callback.answer()
 
@@ -1105,6 +1119,9 @@ async def set_rem_save(
     business: Business,
     state: FSMContext,
 ):
+    if not await _is_owner(session, business, callback.from_user.id):
+        await callback.answer("Настройки меняет владелец", show_alert=True)
+        return
     payload = callback.data[len("set:rem:"):]
     if payload == "custom":
         await state.set_state(MasterFSM.set_rem)
@@ -1117,7 +1134,7 @@ async def set_rem_save(
     await state.clear()
     await callback.message.answer(
         f"Напоминания обновлены: {_offsets_human(offsets)}. Новые записи получат этот набор.",
-        reply_markup=await _main_kb(session, business, message.from_user.id),
+        reply_markup=await _main_kb(session, business, callback.from_user.id),
     )
     await callback.answer()
 
@@ -1129,6 +1146,10 @@ async def set_rem_custom_save(
     business: Business,
     state: FSMContext,
 ):
+    if not await _is_owner(session, business, message.from_user.id):
+        await message.answer("Настройки салона меняет владелец.")
+        await state.clear()
+        return
     parts = (message.text or "").replace(" ", "").split(",")
     offsets: list[int] = []
     for p in parts:
