@@ -144,3 +144,41 @@ async def test_canceled_does_not_block_slot(session):
         )
     )
     await session.commit()
+
+@pytest.mark.asyncio
+async def test_cross_staff_overlap_allowed(session):
+    business, client, service, staff = await _seed(session)
+    other = Staff(
+        business_id=business.id,
+        name="Maria",
+        telegram_id=300,
+        is_owner=False,
+    )
+    session.add(other)
+    await session.flush()
+
+    start = _utc(12)
+    end = _utc(13, 30)
+    session.add(
+        Appointment(
+            business_id=business.id,
+            staff_id=staff.id,
+            client_id=client.id,
+            service_id=service.id,
+            starts_at=start,
+            ends_at=end,
+            status=AppointmentStatus.confirmed,
+        )
+    )
+    session.add(
+        Appointment(
+            business_id=business.id,
+            staff_id=other.id,
+            client_id=client.id,
+            service_id=service.id,
+            starts_at=start,
+            ends_at=end,
+            status=AppointmentStatus.confirmed,
+        )
+    )
+    await session.commit()
