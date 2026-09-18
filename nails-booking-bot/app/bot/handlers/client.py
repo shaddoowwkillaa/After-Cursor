@@ -130,9 +130,30 @@ async def start_booking(
         await message.answer("Пока нет доступных мастеров.")
         return
     if len(staff_list) == 1:
-        # Если мастер один — пропускаем выбор, сразу к услугам
         await state.update_data(staff_id=staff_list[0].id)
         await _show_services_for_staff(message, session, business, staff_list[0], state)
+        return
+    await state.set_state(BookFSM.choosing_staff)
+    await message.answer("Выберите мастера:", reply_markup=staff_kb(staff_list))
+
+
+async def _show_services_for_staff(
+    message, session: AsyncSession, business: Business, staff: Staff, state: FSMContext
+):
+    services = (
+        await session.scalars(
+            select(Service)
+            .where(
+                Service.business_id == business.id,
+                Service.staff_id == staff.id,
+                Service.is_active.is_(True),
+            )
+            .order_by(Service.position, Service.id)
+        )
+    ).all()
+    if not services:
+        await message.answer(f"У мастера {staff.name} пока нет доступных услуг.")
+        await state.clear()
         return
     await state.set_state(BookFSM.choosing_service)
     markup = services_kb(services)
@@ -161,30 +182,6 @@ async def book_staff(
     await _show_services_for_staff(callback.message, session, business, staff, state)
     await callback.answer()
 
-
-async def _show_services_for_staff(
-    message, session: AsyncSession, business: Business, staff: Staff, state: FSMContext
-):
-    services = (
-        await session.scalars(
-            select(Service)
-            .where(
-                Service.business_id == business.id,
-                Service.staff_id == staff.id,
-                Service.is_active.is_(True),
-            )
-            .order_by(Service.position, Service.id)
-        )
-    ).all()
-    if not services:
-        await message.answer(f"У мастера {staff.name} пока нет доступных услуг.")
-        await state.clear()
-        return
-    await state.set_state(BookFSM.choosing_service)
-    await message.answer(
-        f"Мастер: {staff.name}\nВыберите услугу:",
-        reply_markup=services_kb(services),
-    )
 
 
 @router.callback_query(BookFSM.choosing_service, ServiceCB.filter())
