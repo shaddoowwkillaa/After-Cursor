@@ -25,15 +25,15 @@ def client_main_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def master_main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Записи"), KeyboardButton(text="Клиенты")],
-            [KeyboardButton(text="Услуги"), KeyboardButton(text="Окошки")],
-            [KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True,
-    )
+def master_main_kb(is_owner: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Записи"), KeyboardButton(text="Клиенты")],
+        [KeyboardButton(text="Услуги"), KeyboardButton(text="Окошки")],
+    ]
+    if is_owner:
+        rows.append([KeyboardButton(text="👥 Мастера"), KeyboardButton(text="📊 Сводка")])
+    rows.append([KeyboardButton(text="⚙️ Настройки")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def remove_kb() -> ReplyKeyboardRemove:

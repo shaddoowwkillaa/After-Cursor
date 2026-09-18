@@ -7,7 +7,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,16 +49,15 @@ router.callback_query.filter(RoleFilter("master"))
 
 
 async def _current_staff(session, business, telegram_id: int) -> Staff | None:
-    """Возвращает staff по telegram_id; для клиента — owner бизнеса."""
+    """Staff по telegram_id; None, если человека нет в команде или он отключён."""
     staff = await session.scalar(
         select(Staff).where(
             Staff.business_id == business.id,
             Staff.telegram_id == telegram_id,
-            Staff.is_active.is_(True),
         )
     )
     if staff is not None:
-        return staff
+        return staff if staff.is_active else None
     return await session.scalar(
         select(Staff).where(
             Staff.business_id == business.id,
@@ -66,6 +65,14 @@ async def _current_staff(session, business, telegram_id: int) -> Staff | None:
             Staff.is_active.is_(True),
         )
     )
+
+async def _is_owner(session, business, telegram_id: int) -> bool:
+    staff = await _current_staff(session, business, telegram_id)
+    return staff is not None and staff.is_owner
+
+
+async def _main_kb(session, business, telegram_id: int):
+    return master_main_kb(await _is_owner(session, business, telegram_id))
 
 
 class MasterFSM(StatesGroup):
@@ -87,6 +94,8 @@ class MasterFSM(StatesGroup):
     win_del_date = State()
     set_name = State()
     set_rem = State()
+    staff_name = State()
+    staff_tid = State()
 
 
 def _tz(business: Business) -> ZoneInfo:
@@ -94,18 +103,18 @@ def _tz(business: Business) -> ZoneInfo:
 
 
 @router.message(CommandStart())
-async def start(message: Message, business: Business, state: FSMContext):
+async def start(message: Message, business: Business, session: AsyncSession, state: FSMContext):
     await state.clear()
     await message.answer(
         f"Кабинет мастера «{business.name}».",
-        reply_markup=master_main_kb(),
+        reply_markup=await _main_kb(session, business, message.from_user.id),
     )
 
 
 @router.message(F.text == "Отмена")
-async def cancel_flow(message: Message, state: FSMContext):
+async def cancel_flow(message: Message, session: AsyncSession, business: Business, state: FSMContext):
     await state.clear()
-    await message.answer("Отменено.", reply_markup=master_main_kb())
+    await message.answer("Отменено.", reply_markup=await _main_kb(session, business, message.from_user.id))
 
 
 # --- записи ---
@@ -577,7 +586,7 @@ async def svc_duration(
             service.price_minor = data["price_minor"]
             service.duration_minutes = duration
             await session.commit()
-            await message.answer("Услуга обновлена.", reply_markup=master_main_kb())
+            await message.answer("Услуга обновлена.", reply_markup=await _main_kb(session, business, message.from_user.id))
     else:
         max_pos = await session.scalar(
             select(Service.position)
@@ -597,7 +606,7 @@ async def svc_duration(
             )
         )
         await session.commit()
-        await message.answer("Услуга добавлена.", reply_markup=master_main_kb())
+        await message.answer("Услуга добавлена.", reply_markup=await _main_kb(session, business, message.from_user.id))
     await state.clear()
 
 
@@ -1079,7 +1088,7 @@ async def set_name_save(
     await state.clear()
     await message.answer(
         f"Готово. Теперь кабинет называется «{business.name}».",
-        reply_markup=master_main_kb(),
+        reply_markup=await _main_kb(session, business, message.from_user.id),
     )
 
 
@@ -1108,7 +1117,7 @@ async def set_rem_save(
     await state.clear()
     await callback.message.answer(
         f"Напоминания обновлены: {_offsets_human(offsets)}. Новые записи получат этот набор.",
-        reply_markup=master_main_kb(),
+        reply_markup=await _main_kb(session, business, message.from_user.id),
     )
     await callback.answer()
 
@@ -1140,5 +1149,194 @@ async def set_rem_custom_save(
     await state.clear()
     await message.answer(
         f"Напоминания обновлены: {_offsets_human(offsets)}. Новые записи получат этот набор.",
-        reply_markup=master_main_kb(),
+        reply_markup=await _main_kb(session, business, message.from_user.id),
+    )
+
+# --- команда салона (владелец) ---
+
+
+class StaffManageCB(CallbackData, prefix="mng"):
+    id: int
+    act: str
+
+
+@router.message(F.text == "👥 Мастера")
+async def staff_home(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    await state.clear()
+    if not await _is_owner(session, business, message.from_user.id):
+        await message.answer("Раздел доступен только владельцу салона.")
+        return
+    staff_list = (
+        await session.scalars(
+            select(Staff).where(Staff.business_id == business.id).order_by(Staff.id)
+        )
+    ).all()
+    rows = []
+    for s in staff_list:
+        flag = "🟢" if s.is_active else "🔴"
+        suffix = " · владелец" if s.is_owner else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{flag} {s.name}{suffix}",
+                    callback_data=StaffManageCB(id=s.id, act="i").pack(),
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Добавить мастера", callback_data="mngadd")])
+    await message.answer("Команда салона:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "mngadd")
+async def staff_add_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    business: Business,
+    state: FSMContext,
+):
+    if not await _is_owner(session, business, callback.from_user.id):
+        await callback.answer("Только владелец", show_alert=True)
+        return
+    await state.set_state(MasterFSM.staff_name)
+    await callback.message.answer("Имя нового мастера (как его увидят клиенты):")
+    await callback.answer()
+
+
+@router.message(MasterFSM.staff_name, F.text)
+async def staff_name_save(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.answer("Слишком коротко. Введите ещё раз.")
+        return
+    await state.update_data(staff_name=name[:100])
+    await state.set_state(MasterFSM.staff_tid)
+    await message.answer(
+        "Пришли Telegram ID мастера числом.\n"
+        "Мастер узнаёт свой ID так: пишет боту @userinfobot и получает число в ответ."
+    )
+
+
+@router.message(MasterFSM.staff_tid, F.text)
+async def staff_tid_save(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("ID — это число. Попробуй ещё раз.")
+        return
+    tid = int(raw)
+    data = await state.get_data()
+    exists = await session.scalar(
+        select(Staff.id).where(Staff.business_id == business.id, Staff.telegram_id == tid)
+    )
+    if exists is not None:
+        await state.clear()
+        await message.answer(
+            "Этот Telegram уже есть в команде.",
+            reply_markup=await _main_kb(session, business, message.from_user.id),
+        )
+        return
+    session.add(
+        Staff(
+            business_id=business.id,
+            name=data["staff_name"],
+            telegram_id=tid,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    await session.commit()
+    await state.clear()
+    link = f"https://t.me/{business.bot_username}" if business.bot_username else "бот салона в Telegram"
+    await message.answer(
+        f"Мастер {data['staff_name']} добавлен в команду.\n\n"
+        "Пришли ей эту инструкцию:\n"
+        f"1) Открой {link} и нажми /start.\n"
+        "2) Бот узнает тебя по аккаунту и откроет твой личный кабинет.\n"
+        "3) В «Услуги» добавь свои услуги и цены, в «Окошки» выложи свободные времена.\n"
+        "4) Клиенты будут выбирать тебя в списке мастеров и записываться только на твои окошки.",
+        reply_markup=await _main_kb(session, business, message.from_user.id),
+    )
+
+
+@router.callback_query(StaffManageCB.filter())
+async def staff_manage(
+    callback: CallbackQuery,
+    callback_data: StaffManageCB,
+    session: AsyncSession,
+    business: Business,
+):
+    if not await _is_owner(session, business, callback.from_user.id):
+        await callback.answer("Только владелец", show_alert=True)
+        return
+    s = await session.scalar(
+        select(Staff).where(Staff.business_id == business.id, Staff.id == callback_data.id)
+    )
+    if s is None:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    if callback_data.act == "i":
+        kb_rows = []
+        if not s.is_owner:
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Отключить" if s.is_active else "Включить",
+                        callback_data=StaffManageCB(id=s.id, act="t").pack(),
+                    )
+                ]
+            )
+        await callback.message.answer(
+            f"{s.name}\nСтатус: {'активен' if s.is_active else 'отключён'}"
+            + (" · владелец салона" if s.is_owner else ""),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None,
+        )
+        await callback.answer()
+        return
+    if callback_data.act == "t":
+        if s.is_owner:
+            await callback.answer("Владельца нельзя отключить", show_alert=True)
+            return
+        s.is_active = not s.is_active
+        await session.commit()
+        await callback.message.answer(f"{s.name}: " + ("включена." if s.is_active else "отключена."))
+        await callback.answer()
+
+
+@router.message(F.text == "📊 Сводка")
+async def salon_summary(message: Message, session: AsyncSession, business: Business, state: FSMContext):
+    await state.clear()
+    if not await _is_owner(session, business, message.from_user.id):
+        await message.answer("Раздел доступен только владельцу салона.")
+        return
+    tz = _tz(business)
+    today = datetime.now(tz).date()
+    week_start = today - timedelta(days=6)
+    week_start_utc = datetime.combine(week_start, time.min, tzinfo=tz).astimezone(timezone.utc)
+    today_utc = datetime.combine(today, time.min, tzinfo=tz).astimezone(timezone.utc)
+    staff_list = (
+        await session.scalars(
+            select(Staff).where(Staff.business_id == business.id).order_by(Staff.id)
+        )
+    ).all()
+    lines = [f"Сводка салона за 7 дней (с {week_start.strftime('%d.%m')}):"]
+    for s in staff_list:
+        week_cnt = await session.scalar(
+            select(func.count(Appointment.id)).where(
+                Appointment.business_id == business.id,
+                Appointment.staff_id == s.id,
+                Appointment.status != AppointmentStatus.canceled,
+                Appointment.starts_at >= week_start_utc,
+            )
+        )
+        today_cnt = await session.scalar(
+            select(func.count(Appointment.id)).where(
+                Appointment.business_id == business.id,
+                Appointment.staff_id == s.id,
+                Appointment.status != AppointmentStatus.canceled,
+                Appointment.starts_at >= today_utc,
+            )
+        )
+        lines.append(f"{s.name}: сегодня {today_cnt or 0}, за 7 дней {week_cnt or 0}")
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=await _main_kb(session, business, message.from_user.id),
     )
